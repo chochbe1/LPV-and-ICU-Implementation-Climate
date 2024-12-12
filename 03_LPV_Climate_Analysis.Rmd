@@ -432,6 +432,7 @@ ggsave('percent_LPV_byicu.pdf',
        path = 'graphs/')
 
 #Version for Paper
+#Version for Paper
 ggplot(df, aes(x=reorder(study_icu, temp_mean_tv), y=tv_weighted24)) +
   stat_summary(fun = mean, color = "orangered4",
                geom = "crossbar", width = 0.60, alpha = 0.75, linewidth = 0.50) +
@@ -445,11 +446,19 @@ ggplot(df, aes(x=reorder(study_icu, temp_mean_tv), y=tv_weighted24)) +
                      labels=c('1', '2', '3', '4', '5', '6', '7', '8', '9', '10', '11', '12+'),
                      name = 'Tidal Volume (kg/IBW) \n Weighted Average in 1st 24 Hours',
                      sec.axis =  sec_axis(trans = ~.*10, 
-                                          name = '        % of First 24 Hours LPV Acheived',
+                                          name = '        Percent LPV Acheived (%)',
                                           breaks=seq(0,100, by = 10))) +
   scale_x_discrete(labels=c('1','2', '3','4','5','6','7','8',
                             '9','10','11','12','13','14')) +
-  xlab('ICUs Ranked by Mean Time-weighted Tidal Volume')
+  xlab('ICUs Ranked by Mean Time-weighted Tidal Volume') +
+  theme(
+    axis.text.y = element_text(color = "orangered4"),  # Color for primary y-axis ticks
+    axis.text.y.right = element_text(color = "darkblue"),  # Color for secondary y-axis ticks
+    axis.title.y.right = element_text(color = "darkblue", size = 12), # Secondary y-axis title color
+    axis.title.y = element_text(color = "orangered4", size = 12),  # Primary y-axis title color
+    panel.grid.major = element_line(color = "grey80", size = 0.15), # Lighter major gridlines
+    panel.grid.minor = element_line(color = "grey90", size = 0.075),  # Lighter minor gridlines
+  )
 ggsave('percent_LPV_byicu_forpaper.pdf',
        path = 'graphs/')
 
