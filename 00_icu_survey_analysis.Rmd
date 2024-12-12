@@ -1,0 +1,794 @@
+---
+title: "2024_jhhs_icu_survey_analysis"
+author: "Chad Hochberg"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+#Libraries Used in This Script
+library(tidyverse) #dplyr syntaxfor data wrangling
+library(data.table) #Some commands here are faster than dplyr when working with big data
+library(lubridate) #Functions for working with dates in dplyr
+library(collapse)
+library(tableone) #Easy to Make Tables
+library(DescTools) #For Descriptive Statistics and Contingency Tables
+library(gridExtra) #Arrange Plots
+library(survey) #For Clustered Standard Errors of Unit Level Means
+library(miceadds) #For Clustered Linear Model
+library(margins)
+library(psych) #For Cronbach's Alpha (https://rforhr.com/cronbachsalpha.html)
+
+#Set Working Directory
+knitr::opts_knit$set(root.dir = "S:/Hochberg_K23/Aim1/Survey")
+
+#Create Commonly Used Function
+`%!in%` = Negate(`%in%`)
+
+#Select is dplyr::select
+select <- dplyr::select
+```
+
+```{r Load Survey}
+load(file = 'data/icuimp_survey_clean.Rdata')
+```
+
+
+#Suburban has 2 12 bed ICUs but Shares Medical Staff and Were Recruited as One
+#For now analyze as 2 Different ICUs (as they are) - If combined can use code below
+survey_clean <- survey_clean |>
+  mutate(primary_icu.factor=fifelse(
+    primary_icu.factor %in% c('Suburban 3100 ICU', 'Suburban 3400 ICU'),
+    'Suburban ICUs', primary_icu.factor
+  ))
+
+
+```{r Describe and Assess Survey Response Rate, echo = FALSE}
+#Remove Small Number of Duplicated Survey Invitations (Fortunately, no duplicate responses)
+survey_analytic <- survey_clean |>
+  filter(duplicate_email==0 |
+                 (duplicate_email==1 & keep_duplicate_email==1))
+cat(dim(survey_clean)[1]-dim(survey_analytic)[1], 'observations involving duplicate survey invitations were removed \n')
+
+#Remove Emails That Were Not Able to be Delivered Due to Inactive Email Addresses
+orig_n <- dim(survey_analytic)[1]
+survey_analytic <- survey_analytic |>
+  filter(email_error==0)
+cat(orig_n-dim(survey_analytic)[1], 'surveys unable to be delivered, email address did not work \n')
+
+#There are 2 Participants Who are Listed as responded=='Yes' but have no data - Change their response to 'No'
+#I think this means they opened the survey but than never filled anything out
+survey_analytic <- survey_analytic |>
+  mutate(responded=fifelse(responded=='Yes' & is.na(primary_icu), 'No', responded)) |>
+  #The 1 Partial Responses Also Didn't Yield Any Data
+  mutate(responded=fifelse(responded=='Partial', 'No', responded)) 
+  
+#Final Population that Was Sent Survey
+#Describe Range for First and Last Date the Survey Was Sent
+cat('\n', dim(survey_analytic)[1], 'ICU Staff Were Sent Surveys \n')
+cat('The First Survey Was Sent on: ', as.character(min(survey_analytic$first_send_time)), '\n')
+cat('The Last Survey Was Sent on: ', as.character(max(survey_analytic$first_send_time)), '\n')
+
+cat('\n Potential participants received a median of ', median(survey_analytic$total_survey_send), 'survey invitations \n')
+cat('Among Those that Responded, there was a median of ', 
+    median(survey_analytic$total_survey_send[survey_analytic$responded=='Yes']), 
+    '(range:', range(survey_analytic$total_survey_send[survey_analytic$responded=='Yes']), ')survey invitations sent \n')
+cat('Number of Invitations Sent for Invitees Who Participated \n')
+print(PercTable(table(survey_analytic$responded, survey_analytic$total_survey_send), rfrq = '010', margins = 1))
+cat('\n')
+
+#Describe Response Rate by Anticipated Unit - THat is the Unit that a Participant Was Assigned at Invitation based on Staff List (May not be self-identified primary ICU for those that work in multiple ICUs)
+cat('Response Rate by Anticipated Unit, Based on ICU Staff Lists \n')
+print(
+  CreateCatTable(data = survey_analytic, vars = c('responded'), strata = c('anticipated_unit'), includeNA = FALSE, addOverall = TRUE))
+
+cat('Response Rate by Staff ROle, Based on ICU Staff Lists \n')
+print(
+  CreateCatTable(data = survey_analytic, vars = c('responded'), strata = c('staff_role'), includeNA = FALSE, addOverall = TRUE))
+
+#Filter To Only Those Who Responded. The 1 'Partial' response has no data
+survey_analytic <- survey_analytic |>
+  filter(responded=='Yes')
+orig_n <- dim(survey_analytic)[1]
+#Exclude Those Who Didn't Work at Least 4 Weeks in an ICU in Past 12 Months
+survey_analytic <- survey_analytic |>
+  filter(work_in_icu==1)
+cat('\n', orig_n-dim(survey_analytic)[1], 'were excluded for less than 4 weeks of work in an ICU in the past 12 months \n')
+
+#Exclude ICUs that Did not End Up Participating
+orig_n <- dim(survey_analytic)[1]
+survey_analytic <- survey_analytic |>
+  filter(primary_icu %!in% c(1,4, 99))
+cat('\n', orig_n-dim(survey_analytic)[1], 'were excluded as they did not identify one of the study ICUs as their primary ICU \n')
+
+#How many Completed Different Parts of the Survey
+cat('\n #Of Participants Who Completed Survey Sections \n')
+print(CreateCatTable(vars = c('icu_role_and_demographics_complete',
+                               'cfir_inner_setting_complete',
+                               'resources_complete',
+                               'oric_complete'), data = survey_analytic))
+
+#Can Further Exclude Those that Completed None of the Survey Instruments
+orig_n <- dim(survey_analytic)[1]
+survey_analytic <- survey_analytic |>
+  mutate(drop=fifelse(cfir_inner_setting_complete=='no' & resources_complete=='no' & oric_complete=='no', 1, 0)) |>
+  filter(drop==0) |> select(-drop)
+cat('\n', orig_n-dim(survey_analytic)[1], 'were excluded as they did not complete any of the survey scales \n')
+cat('\n Final Sample Size: ', dim(survey_analytic)[1], '\n')
+
+cat('\n Distribution of Primary ICUs in Final Sample \n')
+print(PercTable(table(survey_analytic$primary_icu.factor), rfrq = '001'))
+
+```
+
+
+```{r Calculate Response Rate A Second Way - This is Those Who Have Data to Analyze, echo = FALSE}
+#Keep Track of Who is in Analytic Set
+yes <- survey_analytic |>
+  select(id) |>
+  mutate(analytic_set='Yes')
+
+survey_response <- survey_clean |>
+  filter(duplicate_email==0 |
+                 (duplicate_email==1 & keep_duplicate_email==1)) |>
+  filter(email_error==0) |>
+  left_join(yes) |>
+  mutate(analytic_set=fifelse(is.na(analytic_set), 'No', analytic_set))
+
+#Table of Those in Analytic Set vs Who Surveys Were Sent Out To - Based on the Anticipated Unit
+cat('Number (%) in Analytic Dataset by Anticipated Unit, Based on ICU Staff Lists')
+print(
+  CreateCatTable(data = survey_response, vars = c('analytic_set'), strata = c('anticipated_unit'), includeNA = FALSE, addOverall = TRUE))
+
+rm(survey_response, yes)
+```
+
+
+```{r Create Additional Variables for Table 1}
+survey_analytic <- survey_analytic |>
+  mutate(nonwhite=fifelse(
+    race!='White', 1, 0
+  )) |>
+  mutate(icu_weeks_gt20=fifelse(
+    weeks_in_icu>=3, 1, 0
+  )) |>
+  mutate(icu_years_gt10=fifelse(
+    work_2>=3, 1, 0
+  )) |>
+  mutate(academic_icu=fifelse(
+    primary_icu.factor %in% 
+      c('BMC CARDIAC ICU', 'BMC MEDICAL ICU',
+        'BMC SURGICAL ICU', 'JHH CCU, 5W', 'JHH CVSICU, 5E',
+        'JHH MICU, 10E', 'JHH NCCU, 3W', 'JHH ONC ICU, Weinberg 5C',
+        'JHH SICU, 9E', 'JHH WICU, Weinberg 3A'), 1, 0
+  )) |>
+  mutate(subspec_icu=fifelse(
+    primary_icu.factor %in%
+      c('BMC CARDIAC ICU', 'JHH CCU, 5W',
+        'JHH CVSICU, 5E', 'JHH NCCU, 3W'), 1, 0
+  ))
+
+```
+
+
+```{r Create Table Describing Participants at Individual and Unit Level}
+to_tab <- c('age', 'gender', 'race', 'nonwhite', 'ethnicity', 'icu_role', 
+            'weeks_in_icu.factor', 'icu_weeks_gt20', 'work_1.factor',
+              'work_2.factor', 'icu_years_gt10', 'academic_icu', 'subspec_icu')
+nonnorm_tab <- c('age')
+factors_tab <- c('gender', 'race', 'nonwhite', 'ethnicity', 'icu_role', 
+                 'weeks_in_icu.factor', 'icu_weeks_gt20', 'work_1.factor',
+              'work_2.factor', 'icu_years_gt10', 'academic_icu', 'subspec_icu')
+
+tab1 <- CreateTableOne(data = survey_analytic, vars = to_tab, factorVars = factors_tab)
+summary(tab1)
+
+tab1 <- CreateTableOne(vars = to_tab, strata="primary_icu.factor", data=survey_analytic, factorVars = factors_tab, addOverall = TRUE)
+print(tab1, nonnormal=nonnorm_tab)
+tab1_excel <- print(tab1, nonnorm=nonnorm_tab, printToggle = FALSE)
+write.csv(tab1_excel, file="tables/table1_survey_demos.csv")
+rm(tab1_excel)
+```
+
+
+```{r Describe Missingness of Survey Items, echo = FALSE}
+#Create Vectors of Survey Scales
+culture <- c('culture_1', 'culture_2', 'culture_3', 
+              'culture_4', 'culture_5', 'culture_6', 
+             'culture_7', 'culture_8', 'culture_9')
+
+stress <- c('stress_1', 'stress_2', 'stress_3', 'stress_4')
+
+#NOTE: Resource quetsions 4-6 are proning specific
+resources <- c('resource_1', 'resource_2', 'resource_3', 
+               'resource_4', 'resource_5', 'resource_6')
+  
+oric <- c('oric_1', 'oric_2', 'oric_3', 
+          'oric_4', 'oric_5', 'oric_6', 
+          'oric_7', 'oric_8', 'oric_9',
+          'oric_10','oric_11','oric_12')
+
+efficacy <- c('efficacy_1', 'efficacy_2', 'efficacy_3', 'efficacy_4')
+
+#Funtion to Describe Missingness in Survey Scales
+fn.miss_survey <- function(x) {
+temp <- survey_analytic |>
+  select(all_of(x))
+
+p_missing <- unlist(lapply(temp, function(x) sum(is.na(x))))/nrow(temp)
+n_missing <- unlist(lapply(temp, function(x) sum(is.na(x))))
+missing <- data.frame("N Missing" = n_missing[n_missing>0], 
+                 "Percent Missing" = p_missing[p_missing>0]) 
+print(missing)
+}
+cat('Missinginess in CFIR Culture Results \n')
+fn.miss_survey(culture)
+cat('\n Missinginess in CFIR Staff Stress Results \n')
+fn.miss_survey(stress)
+cat('\n Missinginess in CFIR Resources Results \n')
+fn.miss_survey(resources)
+cat('\n Missinginess in ORIC \n')
+fn.miss_survey(oric)
+cat('\n Missinginess in Self-Efficacy \n')
+fn.miss_survey(efficacy)
+```
+
+
+```{r CFIR Inner Setting: Culture. Distribution by Item, Mean and Median Scores}
+#Calculate the Mean Score Per Participant
+survey_analytic <- survey_analytic |>
+  mutate(culture_ind_mean=rowMeans(survey_analytic[culture], na.rm=TRUE)) |>
+  relocate(culture_ind_mean, .after = culture_9)
+
+#Function to Create Histogram of Survey Item Responses
+fn.item_hist <- function(x) {
+  ggplot(survey_analytic, aes_string(x)) +
+    geom_histogram(binwidth = 0.5, center = 0) +
+    labs(x = "Survey Score", y= "Count", title=paste0(x), size = rel(0.25)) +
+    theme_light()
+}
+
+# Create a function to loop through each item and generate histograms
+generate_histograms <- function(data, items) {
+  plots <- list()
+  for (item in items) {
+    plots[[item]] <- fn.item_hist(item)
+  }
+  return(plots)
+}
+
+#With the Above Functions Can Create a List of Histograms
+items <- c(culture, 'culture_ind_mean')
+culture_histograms <- generate_histograms(survey_analytic, items)
+
+# To display the histograms, you can use print() or grid.arrange from the gridExtra package
+grid.arrange(grobs = culture_histograms, ncol = 4)
+ggsave('culture_histograms.pdf',
+       device = "pdf",
+       path='graphs/')
+
+fn.survey_sum <- function(x) {
+  temp <- survey_analytic |>
+    select(all_of(x))
+  
+  non_miss <- unlist(lapply(temp, function(col) sum(!is.na(col))))
+  mean_values <- unlist(lapply(temp, function(col) round(mean(col, na.rm = TRUE), digits = 2)))
+  sd_values <- unlist(lapply(temp, function(col) round(sd(col, na.rm = TRUE), digits = 2)))
+  median_values <- unlist(lapply(temp, function(col) round(median(col, na.rm = TRUE), digits = 1)))
+  iqr_values <- t(sapply(temp, function(col) round(quantile(col, na.rm = TRUE, probs = c(0.25, 0.75)), digits = 1)))
+  range_values <- t(sapply(temp, function(col) range(col, na.rm = TRUE)))
+  
+  summary <- data.frame(
+    "N" = non_miss,
+    "Mean" = mean_values, 
+    "SD" = sd_values, 
+    "Median" = median_values, 
+    "IQR" = apply(iqr_values, 1, function(row) paste0("  (", row[1], ", ", row[2], ")")),
+    "Range" = apply(range_values, 1, function(row) paste0("(", row[1], ", ", row[2], ")"))
+  )
+  
+  print(summary)
+}
+fn.survey_sum(items)
+cat('\n Cronbachs Alpha for Culture Items [https://rforhr.com/cronbachsalpha.html]')
+alpha(survey_analytic[culture])
+
+# Summarize The Mean Culture Score for Each Item
+culture_unit_level <- survey_analytic |>
+  group_by(primary_icu.factor) |>
+  summarise(n_unit_culture = sum(!is.na(culture_ind_mean)),
+            mean_unit_culture = mean(culture_ind_mean, na.rm = TRUE),
+            sd_unit_culture = sd(culture_ind_mean, na.rm = TRUE),
+            se_unit_culture = sd(culture_ind_mean, na.rm = TRUE) / sqrt(n()),
+            mean_culture1 = mean(culture_1, na.rm = TRUE),
+            mean_culture2 = mean(culture_2, na.rm = TRUE),
+            mean_culture3 = mean(culture_3, na.rm = TRUE),
+            mean_culture4 = mean(culture_4, na.rm = TRUE),
+            mean_culture5 = mean(culture_5, na.rm = TRUE),
+            mean_culture6 = mean(culture_6, na.rm = TRUE),
+            mean_culture7 = mean(culture_7, na.rm = TRUE),
+            mean_culture8 = mean(culture_8, na.rm = TRUE),
+            mean_culture9 = mean(culture_9, na.rm = TRUE)) |>
+  arrange(mean_unit_culture)
+
+#To get Correct Standard Errors (accounting for clustering by ICU), need to run linear model and then use margins to get fitted and standard errors
+lmculture <- lm.cluster(culture_ind_mean ~ primary_icu.factor, 
+                        cluster = 'primary_icu',
+                        data = survey_analytic)
+margins_culture <- margins(lmculture$lm_res, vcov = lmculture$vcov, variables = 'primary_icu.factor',
+        data = survey_analytic) |>
+  select(primary_icu.factor, fitted, se.fitted) |>
+  group_by(primary_icu.factor) |>
+  filter(row_number()==1) |>
+  ungroup()
+
+#Merge Back Into Culture Data Frame
+culture_unit_level <- culture_unit_level |> join(margins_culture, how ='left') |>
+  mutate(se_unit_culture=se.fitted)
+rm(lmculture, margins_culture)
+
+ggplot(culture_unit_level, aes(x = reorder(primary_icu.factor, mean_unit_culture), y = mean_unit_culture)) +
+  geom_point(stat = "identity") +
+  geom_errorbar(aes(ymin = mean_unit_culture - se_unit_culture*1.96, 
+                    ymax = mean_unit_culture + se_unit_culture*1.96), width = 0.4) +
+  scale_y_continuous(breaks=seq(1,5, by=1), limits = c(1,5)) +
+  labs(x = "ICU",
+       y = "Mean Culture Score") +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1)
+  )
+ggsave('culture_score_byunit.pdf',
+       device = "pdf",
+       path='graphs/')
+
+#Now Create Table 
+icu_survey <- svydesign(ids = ~ id+primary_icu.factor, data = survey_analytic)
+tab_culture <- svyCreateTableOne(vars = c('culture_ind_mean'), 
+                                 data = icu_survey, strata = 'primary_icu.factor',
+                                 includeNA = FALSE, 
+                                 addOverall = TRUE)
+print(tab_culture)
+tab_excel <- print(tab_culture, printToggle = FALSE)
+write.csv(tab_excel, file="tables/table_cfir_culture_byunit.csv")
+
+```
+
+
+```{r CFIR ICU Staff Stress Measure}
+#Calculate the Mean Score Per Participant
+survey_analytic <- survey_analytic |>
+  mutate(stress_mean_ind=rowMeans(survey_analytic[stress], na.rm = TRUE)) |>
+  relocate(stress_mean_ind, .after = 'stress_4')
+
+#With the Above Functions Can Create a List of Histograms
+items <- c(stress, 'stress_mean_ind')
+stress_histograms <- generate_histograms(survey_analytic, items)
+
+# To display the histograms, you can use print() or grid.arrange from the gridExtra package
+grid.arrange(grobs = stress_histograms, ncol = 2)
+ggsave('stress_histograms.pdf',
+       device = "pdf",
+       path='graphs/')
+
+#Create Summary of Stress Items
+fn.survey_sum(items)
+cat('\n Cronbachs Alpha for Stress Scale Items')
+print(CronbachAlpha(survey_analytic[stress], conf.level = 0.95, na.rm = TRUE))
+alpha(survey_analytic[stress])
+
+# Summarize at the Unit Level
+stress_unit_level <- survey_analytic |>
+  group_by(primary_icu.factor) |>
+  summarise(n_unit_stress = sum(!is.na(stress_mean_ind)),
+            mean_unit_stress = mean(stress_mean_ind, na.rm = TRUE),
+            sd_unit_stress = sd(stress_mean_ind, na.rm = TRUE),
+            se_unit_stress = sd(stress_mean_ind, na.rm = TRUE) / sqrt(n()),
+            mean_stress1 = mean(stress_1, na.rm = TRUE),
+            mean_stress2 = mean(stress_2, na.rm = TRUE),
+            mean_stress3 = mean(stress_3, na.rm = TRUE),
+            mean_stress4 = mean(stress_4, na.rm = TRUE)) |>
+  arrange(mean_unit_stress)
+
+#To get Correct Standard Errors (accounting for clustering by ICU), need to run linear model and then use margins to get fitted and standard errors
+lmstress <- lm.cluster(stress_mean_ind ~ primary_icu.factor, 
+                        cluster = 'primary_icu',
+                        data = survey_analytic)
+margins_stress <- margins(lmstress$lm_res, vcov = lmstress$vcov, variables = 'primary_icu.factor',
+        data = survey_analytic) |>
+  select(primary_icu.factor, fitted, se.fitted) |>
+  group_by(primary_icu.factor) |>
+  filter(row_number()==1) |>
+  ungroup()
+
+#Merge Back Into stress Data Frame
+stress_unit_level <- stress_unit_level |> join(margins_stress, how ='left') |>
+  mutate(se_unit_stress=se.fitted)
+rm(lmstress, margins_stress)
+
+ggplot(stress_unit_level, aes(x = reorder(primary_icu.factor, mean_unit_stress), y = mean_unit_stress)) +
+  geom_point(stat = "identity") +
+  geom_errorbar(aes(ymin = mean_unit_stress - se_unit_stress*1.96, 
+                    ymax = mean_unit_stress + se_unit_stress*1.96), width = 0.4) +
+  scale_y_continuous(breaks=seq(1,5, by=1), limits = c(1,5)) +
+  labs(x = "ICU",
+       y = "Mean stress Score") +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1)
+  )
+ggsave('stress_score_byunit.pdf',
+       device = "pdf",
+       path='graphs/')
+
+#Now Create Table Using the Survey Design Package
+icu_survey <- svydesign(ids = ~ id+primary_icu.factor, data = survey_analytic)
+tab_stress <- svyCreateTableOne(vars = c('stress_mean_ind'), 
+                                 data = icu_survey, strata = 'primary_icu.factor',
+                                 includeNA = FALSE, 
+                                 addOverall = TRUE)
+print(tab_stress)
+tab_excel <- print(tab_stress, printToggle = FALSE)
+write.csv(tab_excel, file="tables/table_cfir_stress_byunit.csv")
+```
+
+
+```{r Now Describe Resources}
+#Questions 1-3 Were NOT about Proning Specifically, So Will Use Those for the LPV Analysis
+resources <- c(resources)[0:3]
+
+#Calculate the Mean Score Per Participant
+survey_analytic <- survey_analytic |>
+  mutate(resources_mean_ind=rowMeans(survey_analytic[resources], na.rm = TRUE)) |>
+  relocate(resources_mean_ind, .after = 'resource_3')
+
+#With the Above Functions Can Create a List of Histograms
+items <- c(resources, 'resources_mean_ind')
+resources_histograms <- generate_histograms(survey_analytic, items)
+
+# To display the histograms, you can use print() or grid.arrange from the gridExtra package
+grid.arrange(grobs = resources_histograms, ncol = 2)
+ggsave('resources_histograms.pdf',
+       device = "pdf",
+       path='graphs/')
+
+#Create Summary of resources Items
+fn.survey_sum(items)
+cat('\n Cronbachs Alpha for resources Scale Items')
+print(CronbachAlpha(survey_analytic[resources], conf.level = 0.95, na.rm = TRUE))
+alpha(survey_analytic[resources])
+
+# Summarize at the Unit Level
+resources_unit_level <- survey_analytic |>
+  group_by(primary_icu.factor) |>
+  summarise(n_unit_resources = sum(!is.na(resources_mean_ind)),
+            mean_unit_resources = mean(resources_mean_ind, na.rm = TRUE),
+            sd_unit_resources = sd(resources_mean_ind, na.rm = TRUE),
+            se_unit_resources = sd(resources_mean_ind, na.rm = TRUE) / sqrt(n()),
+            mean_resource1 = mean(resource_1, na.rm = TRUE),
+            mean_resource2 = mean(resource_2, na.rm = TRUE),
+            mean_resource3 = mean(resource_3, na.rm = TRUE)) |>
+  arrange(mean_unit_resources)
+
+#To get Correct Standard Errors (accounting for clustering by ICU), need to run linear model and then use margins to get fitted and standard errors
+lmresources <- lm.cluster(resources_mean_ind ~ primary_icu.factor, 
+                        cluster = 'primary_icu',
+                        data = survey_analytic)
+margins_resources <- margins(lmresources$lm_res, vcov = lmresources$vcov, variables = 'primary_icu.factor',
+        data = survey_analytic) |>
+  select(primary_icu.factor, fitted, se.fitted) |>
+  group_by(primary_icu.factor) |>
+  filter(row_number()==1) |>
+  ungroup()
+
+#Merge Back Into resources Data Frame
+resources_unit_level <- resources_unit_level |> join(margins_resources, how ='left') |>
+  mutate(se_unit_resources=se.fitted)
+rm(lmresources, margins_resources)
+  
+
+ggplot(resources_unit_level, aes(x = reorder(primary_icu.factor, mean_unit_resources), y = mean_unit_resources)) +
+  geom_point(stat = "identity") +
+  geom_errorbar(aes(ymin = mean_unit_resources - se_unit_resources*1.96, 
+                    ymax = mean_unit_resources + se_unit_resources*1.96), width = 0.4) +
+  scale_y_continuous(breaks=seq(1,5, by=1), limits = c(1,5)) +
+  labs(x = "ICU",
+       y = "Mean Resources Score") +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1)
+  )
+ggsave('resources_score_byunit.pdf',
+       device = "pdf",
+       path='graphs/')
+
+#Now Create Table Using the Survey Design Package
+icu_survey <- svydesign(ids = ~id+primary_icu, data = survey_analytic)
+tab_resources <- svyCreateTableOne(vars = c('resources_mean_ind'), 
+                                 data = icu_survey, strata = 'primary_icu.factor',
+                                 includeNA = FALSE, 
+                                 addOverall = TRUE)
+print(tab_resources)
+tab_excel <- print(tab_resources, printToggle = FALSE)
+write.csv(tab_excel, file="tables/table_cfir_resources_byunit.csv")
+
+```
+
+```{r Analyze the Proning Specific Resources Questions}
+resources_prone <- c('resource_4', 'resource_6')
+survey_analytic <- survey_analytic |>
+  mutate(prone_resource_ind_mean=rowMeans(survey_analytic[resources_prone], na.rm=TRUE)) |>
+  relocate(culture_ind_mean, .after = resource_6)
+
+#Generate Histograms for Proning Resource Questions
+items <- c(resources_prone, 'prone_resource_ind_mean')
+resource_prone_histograms <- generate_histograms(resources_prone, items)
+
+# To display the histograms, you can use print() or grid.arrange from the gridExtra package
+grid.arrange(grobs = resource_prone_histograms, ncol = 3)
+ggsave('prone_resource_histograms.pdf',
+       device = "pdf",
+       path='graphs/')
+
+fn.survey_sum(resources_prone)
+cat('\n Cronbachs Alpha for Prone Resources')
+print(CronbachAlpha(survey_analytic[resources_prone], conf.level = 0.95, na.rm = TRUE))
+alpha(survey_analytic[resources_prone])
+
+# Summarize The Mean Prone Resources Score for Each Item
+prone_resource_unit_level <- survey_analytic |>
+  group_by(primary_icu.factor) |>
+  summarise(n_unit_proneresources = sum(!is.na(prone_resource_ind_mean)),
+            mean_unit_proneresources = mean(prone_resource_ind_mean, na.rm = TRUE),
+            sd_unit_proneresources = sd(prone_resource_ind_mean, na.rm = TRUE),
+            se_unit_proneresources = sd(prone_resource_ind_mean, na.rm = TRUE) / sqrt(n()),
+            mean_resource4 = mean(resource_4, na.rm = TRUE),
+            mean_resource6 = mean(resource_6, na.rm = TRUE)) |>
+  arrange(mean_unit_proneresources)
+
+#To get Correct Standard Errors (accounting for clustering by ICU), need to run linear model and then use margins to get fitted and standard errors
+lmproneres <- lm.cluster(prone_resource_ind_mean ~ primary_icu.factor, 
+                        cluster = 'primary_icu',
+                        data = survey_analytic)
+margins_proneres <- margins(lmproneres$lm_res, vcov = lmproneres$vcov, variables = 'primary_icu.factor',
+        data = survey_analytic) |>
+  select(primary_icu.factor, fitted, se.fitted) |>
+  group_by(primary_icu.factor) |>
+  filter(row_number()==1) |>
+  ungroup()
+
+#Merge Back Into ProneResources Data Frame
+prone_resource_unit_level <- prone_resource_unit_level |> join(margins_proneres, how ='left') |>
+  mutate(se_unit_proneresources=se.fitted)
+rm(lmproneres, margins_proneres)
+
+ggplot(prone_resource_unit_level, aes(x = reorder(primary_icu.factor, mean_unit_proneresources), y = mean_unit_proneresources)) +
+  geom_point(stat = "identity") +
+  geom_errorbar(aes(ymin = mean_unit_proneresources - se_unit_proneresources*1.96, 
+                    ymax = mean_unit_proneresources + se_unit_proneresources*1.96), width = 0.4) +
+  scale_y_continuous(breaks=seq(1,5, by=1), limits = c(1,5)) +
+  labs(x = "ICU",
+       y = "Mean Resources for Proning") +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1)
+  )
+ggsave('proneres_score_byunit.pdf',
+       device = "pdf",
+       path='graphs/')
+
+#Now Create Table 
+icu_survey <- svydesign(ids = ~ id+primary_icu.factor, data = survey_analytic)
+tab_proneres <- svyCreateTableOne(vars = c('prone_resource_ind_mean'), 
+                                 data = icu_survey, strata = 'primary_icu.factor',
+                                 includeNA = FALSE, 
+                                 addOverall = TRUE)
+print(tab_proneres)
+tab_excel <- print(tab_proneres, printToggle = FALSE)
+write.csv(tab_excel, file="tables/table_prone_resource_byunit.csv")
+
+#Create a Table of the Free Text Answers
+resource_free_text <- survey_analytic |>
+  select(primary_icu.factor, resource_5) |>
+  filter(grepl("[a-zA-Z]", resource_5))
+write_csv(resource_free_text, 'data/resource_free_text.csv')
+```
+
+```{r ORIC Score Analysis}
+#Calculate the Mean Score Per Participant
+survey_analytic <- survey_analytic |>
+  mutate(oric_ind_mean=rowMeans(survey_analytic[oric], na.rm=TRUE)) |>
+  relocate(oric_ind_mean, .after = oric_12)
+
+#Generate ORIC Histograms
+items <- c(oric, 'oric_ind_mean')
+oric_histograms <- generate_histograms(oric, items)
+
+# To display the histograms, you can use print() or grid.arrange from the gridExtra package
+grid.arrange(grobs = oric_histograms, ncol = 6)
+ggsave('oric_histograms.pdf',
+       device = "pdf",
+       path='graphs/')
+
+fn.survey_sum(oric)
+cat('\n Cronbachs Alpha for ORIC Items')
+print(CronbachAlpha(survey_analytic[oric], conf.level = 0.95, na.rm = TRUE))
+alpha(survey_analytic[oric])
+
+# Summarize The Mean oric Score for Each Item
+oric_unit_level <- survey_analytic |>
+  group_by(primary_icu.factor) |>
+  summarise(n_unit_oric = sum(!is.na(oric_ind_mean)),
+            mean_unit_oric = mean(oric_ind_mean, na.rm = TRUE),
+            sd_unit_oric = mean(oric_ind_mean, na.rm = TRUE),
+            se_unit_oric = sd(oric_ind_mean, na.rm = TRUE) / sqrt(n()),
+            mean_oric1 = mean(oric_1, na.rm = TRUE),
+            mean_oric2 = mean(oric_2, na.rm = TRUE),
+            mean_oric3 = mean(oric_3, na.rm = TRUE),
+            mean_oric4 = mean(oric_4, na.rm = TRUE),
+            mean_oric5 = mean(oric_5, na.rm = TRUE),
+            mean_oric6 = mean(oric_6, na.rm = TRUE),
+            mean_oric7 = mean(oric_7, na.rm = TRUE),
+            mean_oric8 = mean(oric_8, na.rm = TRUE),
+            mean_oric9 = mean(oric_9, na.rm = TRUE),
+            mean_oric10 = mean(oric_10, na.rm = TRUE),
+            mean_oric11 = mean(oric_11, na.rm = TRUE),
+            mean_oric12 = mean(oric_12, na.rm = TRUE)) |>
+  arrange(mean_unit_oric)
+
+#To get Correct Standard Errors (accounting for clustering by ICU), need to run linear model and then use margins to get fitted and standard errors
+lmoric <- lm.cluster(oric_ind_mean ~ primary_icu.factor, 
+                        cluster = 'primary_icu',
+                        data = survey_analytic)
+margins_oric <- margins(lmoric$lm_res, vcov = lmoric$vcov, variables = 'primary_icu.factor',
+        data = survey_analytic) |>
+  select(primary_icu.factor, fitted, se.fitted) |>
+  group_by(primary_icu.factor) |>
+  filter(row_number()==1) |>
+  ungroup()
+
+#Merge Back Into Oric Data Frame
+oric_unit_level <- oric_unit_level |> join(margins_oric, how ='left') |>
+  mutate(se_unit_oric=se.fitted)
+rm(lmoric, margins_oric)
+
+ggplot(oric_unit_level, aes(x = reorder(primary_icu.factor, mean_unit_oric), y = mean_unit_oric)) +
+  geom_point(stat = "identity") +
+  geom_errorbar(aes(ymin = mean_unit_oric - se_unit_oric*1.96, 
+                    ymax = mean_unit_oric + se_unit_oric*1.96), width = 0.4) +
+  scale_y_continuous(breaks=seq(1,5, by=1), limits = c(1,5)) +
+  labs(x = "ICU",
+       y = "Mean ORIC Score") +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1)
+  )
+ggsave('oric_score_byunit.pdf',
+       device = "pdf",
+       path='graphs/')
+
+#Now Create Table 
+icu_survey <- svydesign(ids = ~ id+primary_icu.factor, data = survey_analytic)
+tab_oric <- svyCreateTableOne(vars = c('oric_ind_mean'), 
+                                 data = icu_survey, strata = 'primary_icu.factor',
+                                 includeNA = FALSE, 
+                                 addOverall = TRUE)
+print(tab_oric)
+tab_excel <- print(tab_oric, printToggle = FALSE)
+write.csv(tab_excel, file="tables/table_oric_byunit.csv")
+```
+
+```{r Calculate Unit Scores for Efficacy}
+#Calculate the Mean Score Per Participant
+survey_analytic <- survey_analytic |>
+  mutate(efficacy_mean_ind=rowMeans(survey_analytic[efficacy], na.rm = TRUE)) |>
+  relocate(efficacy_mean_ind, .after = 'efficacy_4')
+
+#With the Above Functions Can Create a List of Histograms
+items <- c(efficacy, 'efficacy_mean_ind')
+efficacy_histograms <- generate_histograms(survey_analytic, items)
+
+# To display the histograms, you can use print() or grid.arrange from the gridExtra package
+grid.arrange(grobs = efficacy_histograms, ncol = 3)
+ggsave('efficacy_histograms.pdf',
+       device = "pdf",
+       path='graphs/')
+
+#Create Summary of efficacy Items
+fn.survey_sum(items)
+cat('\n Cronbachs Alpha for efficacy Scale Items')
+print(CronbachAlpha(survey_analytic[efficacy], conf.level = 0.95, na.rm = TRUE))
+alpha(survey_analytic[efficacy])
+
+# Summarize at the Unit Level
+efficacy_unit_level <- survey_analytic |>
+  group_by(primary_icu.factor) |>
+  summarise(n_unit_efficacy = sum(!is.na(efficacy_mean_ind)),
+            mean_unit_efficacy = mean(efficacy_mean_ind, na.rm = TRUE),
+            sd_unit_efficacy = sd(efficacy_mean_ind, na.rm = TRUE), 
+            se_unit_efficacy = sd(efficacy_mean_ind, na.rm = TRUE) / sqrt(n()),
+            mean_efficacy1 = mean(efficacy_1, na.rm = TRUE),
+            mean_efficacy2 = mean(efficacy_2, na.rm = TRUE),
+            mean_efficacy3 = mean(efficacy_3, na.rm = TRUE),
+            mean_efficacy4 = mean(efficacy_4, na.rm = TRUE)) |>
+  arrange(mean_unit_efficacy)
+
+#To get Correct Standard Errors (accounting for clustering by ICU), need to run linear model and then use margins to get fitted and standard errors
+lmefficacy <- lm.cluster(efficacy_mean_ind ~ primary_icu.factor, 
+                        cluster = 'primary_icu',
+                        data = survey_analytic)
+margins_efficacy <- margins(lmefficacy$lm_res, vcov = lmefficacy$vcov, variables = 'primary_icu.factor',
+        data = survey_analytic) |>
+  select(primary_icu.factor, fitted, se.fitted) |>
+  group_by(primary_icu.factor) |>
+  filter(row_number()==1) |>
+  ungroup()
+
+#Merge Back Into efficacy Data Frame
+efficacy_unit_level <- efficacy_unit_level |> join(margins_efficacy, how ='left') |>
+  mutate(se_unit_efficacy=se.fitted)
+rm(lmefficacy, margins_efficacy)
+
+ggplot(efficacy_unit_level, aes(x = reorder(primary_icu.factor, mean_unit_efficacy), y = mean_unit_efficacy)) +
+  geom_point(stat = "identity") +
+  geom_errorbar(aes(ymin = mean_unit_efficacy - se_unit_efficacy*1.96, 
+                    ymax = mean_unit_efficacy + se_unit_efficacy*1.96), width = 0.4) +
+  scale_y_continuous(breaks=seq(1,10, by=1), limits = c(1,10)) +
+  labs(x = "ICU",
+       y = "Mean Self-Efficacy for ARDS EBM") +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1)
+  )
+ggsave('efficacy_score_byunit.pdf',
+       device = "pdf",
+       path='graphs/')
+
+#Now Create Table Using the Survey Design Package
+icu_survey <- svydesign(ids = ~ id+primary_icu.factor, data = survey_analytic)
+tab_efficacy <- svyCreateTableOne(vars = c('efficacy_mean_ind'), 
+                                 data = icu_survey, strata = 'primary_icu.factor',
+                                 includeNA = FALSE, 
+                                 addOverall = TRUE)
+print(tab_efficacy)
+tab_excel <- print(tab_efficacy, printToggle = FALSE)
+write.csv(tab_excel, file="tables/table_efficacy_byunit.csv")
+
+```
+
+```{r Bind Together the Unit Level Tables}
+#Combine Unit Level Tables
+survey_unit_level <- culture_unit_level |>
+  select(-fitted, -se.fitted) |>
+  left_join(stress_unit_level) |>
+  select(-fitted, -se.fitted) |>
+  left_join(resources_unit_level) |>
+  select(-fitted, -se.fitted) |>
+  left_join(prone_resource_unit_level) |>
+  select(-fitted, -se.fitted) |>
+  left_join(oric_unit_level) |>
+  select(-fitted, -se.fitted) |>
+  left_join(efficacy_unit_level) |>
+  select(-fitted, -se.fitted)
+
+#Save Analytic Dataset
+fwrite(survey_analytic, 'data/survey_analytic.csv')
+fwrite(survey_unit_level, 'data/survey_unit_level.csv')
+```
+
+```{r ANOVA for ICU Level Scores}
+to_tab <- c(
+  "mean_unit_culture",
+  "mean_unit_stress",
+  "mean_unit_resources",
+  "mean_unit_oric",
+  "mean_unit_efficacy"
+)
+tab_unit_scores <- CreateTableOne(vars = to_tab, 
+                                 data = survey_unit_level, strata = 'primary_icu.factor',
+                                 includeNA = FALSE, 
+                                 addOverall = TRUE)
+tab_unit_scores
+
+```
+

@@ -1,0 +1,1459 @@
+---
+title: "K23_Aim2_LPV_Culture_CohortClean"
+author: "Chad H. Hochberg"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+library(here) #Makes working with directories easier
+library(tidyverse) #dplyr syntax for data wrangling
+library(data.table) #Some commands here are faster than dplyr when working with big data
+library(arrow) #This library allows working with apache arrow which is a memory efficient way to work with these data
+library(collapse) #Fast Data Manipulation Package
+library(DescTools) #Help for Descriptive Statistics
+
+#Set Working Directory
+knitr::opts_knit$set(root.dir = "~/workspace/Storage/chochbe1/persistent/K23_Aim1_LPV_Analysis")
+
+#Create Commonly Used Function
+`%!in%` = Negate(`%in%`)
+
+#Project Path
+project_path <- '~/workspace/Storage/chochbe1/persistent/K23_Aim1_LPV_Analysis'
+
+#Here
+here::i_am('K23_aim1_lpv_here.R')
+```
+
+
+```{r Open Clinical Dataset and Survey Datasets}
+lpv_clinical_data <- read_parquet(paste0(project_path, '/data/lpv_clinical_data.parquet'))
+survey_analytic <- fread(paste0(project_path, '/data/survey_analytic.csv'))
+survey_unit_level <- fread(paste0(project_path, '/data/survey_unit_level.csv'))
+```
+
+
+#Implement Stage 2 Exclusions for Clinical Data
+1. MV Initiated at OSH
+2. ECMO within 12 hours of LPV Time Zero
+3. Tracheostomy as First Airway and IMV Started on Hospital Day 1
+4. Age >= 18 Years
+5. Died or Discharged within 12 Hours of LPV Time Zero (should be zero of these based on stage 1 exclusions)
+
+```{r Second stage Exclusions}
+cat('\n For Consort: Before Second Stage Exlusions there were', length(unique(lpv_clinical_data$pat_enc_csn_id)), 
+    'encounters amongst,',length(unique(lpv_clinical_data$cohort_id)), 'patients')
+n_enc <- length(unique(lpv_clinical_data$pat_enc_csn_id))
+n_ids <- length(unique(lpv_clinical_data$cohort_id))
+
+#MV at Outside Hospital
+lpv_analytic <- lpv_clinical_data |> 
+  filter(vent_at_osh==0)
+
+cat('\n For Consort:', n_enc-length(unique(lpv_analytic$pat_enc_csn_id)), 
+    'encounters were excluded for MV Initiated at OSH (',n_ids-length(unique(lpv_analytic$cohort_id)), 'patients)')
+n_enc <- length(unique(lpv_analytic$pat_enc_csn_id)) #Track for Consort
+n_ids <- length(unique(lpv_analytic$cohort_id)) #Track for Consort
+
+#Tracheostomy is First Airway and Present in First 24 Hours of Hospitalization
+lpv_analytic <- lpv_analytic |>
+  mutate(trach_exclude=fifelse(
+    tracheostomy=='Trach First Airway' & first_trach_time<=(final_admit_date+dhours(24)), 1, 0)) |> #Small Number of Airway Variables Missing
+  mutate(trach_exclude=fifelse(
+    is.na(tracheostomy), 0, trach_exclude
+  )) |>
+  filter(trach_exclude==0) |>
+  select(-trach_exclude)
+cat('\n For Consort:', n_enc-length(unique(lpv_analytic$pat_enc_csn_id)), 
+    'encounters were excluded for Tracheostomy as First Airway Present on Day 1 (',n_ids-length(unique(lpv_analytic$cohort_id)), 'patients)')
+n_enc <- length(unique(lpv_analytic$pat_enc_csn_id)) #Track for Consort
+n_ids <- length(unique(lpv_analytic$cohort_id)) #Track for Consort
+
+#ECMO Initiated within 12 Hours of LPV Time Zero
+#NOTE: Will Keep the Very Small Group of Patients Who Were Not Intubated on VA_ECMO and then Go On Vent AFTER ECMO Support is OFF (for example, for heart transplant)
+lpv_analytic <- lpv_analytic |>
+  mutate(time_to_ecmo=as.duration(ecmo_start-lpv_time_zero)) |>
+  mutate(ecmo_exclude=fcase(
+    time_to_ecmo<=dhours(12) & ecmo_end>study_vent_start, 1,
+    default = 0
+  )) |>
+  filter(ecmo_exclude==0) |>
+  select(-ecmo_exclude)
+
+cat('\n For Consort:', n_enc-length(unique(lpv_analytic$pat_enc_csn_id)), 
+    'encounters were excluded for VA or VV ECMO started within 12 Hours of Study Vent Start (',n_ids-length(unique(lpv_analytic$cohort_id)),'patients)')
+n_enc <- length(unique(lpv_analytic$pat_enc_csn_id)) #Track for Consort
+n_ids <- length(unique(lpv_analytic$cohort_id)) #Track for Consort
+
+#No Height Available
+lpv_analytic <- lpv_analytic |>
+  filter(!is.na(height_inches))
+cat('\n For Consort:', n_enc-length(unique(lpv_analytic$pat_enc_csn_id)), 
+    'encounters were excluded for no Available Height Measurements (',n_ids-length(unique(lpv_analytic$cohort_id)),'patients)')
+n_enc <- length(unique(lpv_analytic$pat_enc_csn_id)) #Track for Consort
+n_ids <- length(unique(lpv_analytic$cohort_id)) #Track for Consort
+
+#Discharged Within 12 Hours of LPV Time Zero
+#As Expected this is 0
+lpv_analytic <- lpv_analytic |>
+  mutate(dc_exclude=fcase(
+    is.na(final_dc_date) & is.na(study_vent_end), 1,
+    as.duration(final_dc_date-lpv_time_zero)<dhours(12), 1,
+    default=0
+  ))
+cat('\n For Consort:', n_enc-length(unique(lpv_analytic$pat_enc_csn_id)), 
+    'encounters were excluded for Discharge within 12 Hours of LPV Time Zero (',n_ids-length(unique(lpv_analytic$cohort_id)),'patients)')
+n_enc <- length(unique(lpv_analytic$pat_enc_csn_id)) #Track for Consort
+n_ids <- length(unique(lpv_analytic$cohort_id)) #Track for Consort
+
+#Age Less Than 18
+lpv_analytic <- lpv_analytic |>
+  filter(age_at_admission>=18)
+cat('\n For Consort:', n_enc-length(unique(lpv_analytic$pat_enc_csn_id)), 
+    'encounters were excluded Age < 18 years (',n_ids-length(unique(lpv_analytic$cohort_id)),'patients)')
+n_enc <- length(unique(lpv_analytic$pat_enc_csn_id)) #Track for Consort
+n_ids <- length(unique(lpv_analytic$cohort_id)) #Track for Consort
+
+#Temporary List of COhort ID and Encounter Block
+temp_cohort <- lpv_analytic |>
+  select(cohort_id, encounter_block, study_vent_start, study_vent_end, lpv_time_zero) |>
+  mutate(in_cohort=1)
+
+```
+
+```{r Process Long Tidal Volume Data Into 72 Hours and 24 Hour Datasets}
+vent72 <- open_dataset(paste0(project_path, '/data/ventilator_long_72hours.parquet')) |> compute()
+
+#Filter to Those in the Cohort
+vent72_analytic <- vent72 |>
+  left_join(temp_cohort) |>
+  filter(in_cohort==1) |>
+  select(-in_cohort) |>
+  compute()
+  
+rm(vent72, temp_cohort)
+
+vent24_analytic <- vent72_analytic |> collect() |>
+  #Create an End Time for LPV Assessment at 24 Hours (the earliest of ventilator end or 24 hours after lpv time zero)
+  mutate(time_24hours=lpv_time_zero+dhours(24)) |>
+  mutate(lpv_end_24hours=fifelse(
+  time_24hours<=study_vent_end, time_24hours, study_vent_end)) |>
+  select(-time_24hours) |>
+  filter(recorded_time<=lpv_end_24hours)
+  
+#Implement Final Inclusion Criteria
+#No Eligible Tidal Volumes in First 24 Hours
+eligible_tv_cohort <- vent24_analytic |>
+  group_by(cohort_id, encounter_block) |>
+  filter(sum(eligible_tv, na.rm = TRUE)>=1) |>
+  filter(row_number()==1) |>
+  ungroup() |>
+  mutate(yes_tv=1) |>
+  select(cohort_id, encounter_block, yes_tv) 
+
+lpv_analytic <- lpv_analytic |>
+  left_join(eligible_tv_cohort) |>
+  filter(yes_tv==1) |>
+  select(-yes_tv)
+
+cat('\n For Consort:', n_enc-length(unique(lpv_analytic$pat_enc_csn_id)), 
+    'encounters were excluded for no Eligible TV Measurements in First 24 Hours (',n_ids-length(unique(lpv_analytic$cohort_id)),'patients)')
+n_enc <- length(unique(lpv_analytic$pat_enc_csn_id)) #Track for Consort
+n_ids <- length(unique(lpv_analytic$cohort_id)) #Track for Consort
+
+#Finally, For Patients with More Than 1 Encounter Randomly Select 1 Encounter
+set.seed(322)
+temp_cohort <- lpv_analytic |>
+  select(cohort_id, encounter_block) |>
+  group_by(cohort_id) |>
+  slice_sample(n=1) |>
+  ungroup() |>
+  mutate(keep=1) 
+
+lpv_analytic <- lpv_analytic |>
+  left_join(temp_cohort) |>
+  filter(keep==1) |>
+  select(-keep)
+  
+cat('\n For Consort:', n_enc-length(unique(lpv_analytic$pat_enc_csn_id)), 
+    'encounters were excluded after randomly selecting 1 encounter for each eligible patient yielding (',n_ids-length(unique(lpv_analytic$cohort_id)),'patients ecxluded)')
+n_enc <- length(unique(lpv_analytic$pat_enc_csn_id)) #Track for Consort
+n_ids <- length(unique(lpv_analytic$cohort_id)) #Track for Consort
+  
+#Final Cohort Numbers
+cat('\n For Consort:', n_enc, 
+    'encounters in the final cohort (',n_ids,'patients)')
+rm(eligible_tv_cohort)
+```
+
+```{r Describe the LPV Metrics Available}
+final_cohort_ids <- lpv_analytic |>
+  select(cohort_id, encounter_block) |>
+  mutate(in_cohort=1)
+
+#Filter the Vent Observation Tables to Those in the lpv_analytic dataset
+vent72_analytic <- vent72_analytic |>
+  left_join(final_cohort_ids) |>
+  filter(in_cohort==1) |>
+  select(-in_cohort) |>
+  compute()
+vent24_analytic <- vent24_analytic |>
+  left_join(final_cohort_ids) |>
+  filter(in_cohort==1) |>
+  select(-in_cohort) |>
+  compute()
+
+#Primary: % Eligible Time with TV <= 6.5 cc/kg-IBW and Pplat <=30 in 1st 24 hours
+#Need to Calculate Time At LPV and Denominator of Eligible Time
+#Additionally Calculate Components (time-weighted VT per kg IBW and time-weighted PPlat)
+
+#Track Numbers of Observations for Description in the Paper
+cat("\n In the analytic cohort there were,", dim(vent24_analytic)[1], "observed ventilator settings in the first 24 hours")
+
+vent24_outcomes <- vent24_analytic |>
+  #How Many Ventilator Measurements in First 24Hours
+  group_by(cohort_id) |>
+  mutate(n_vent_observations=n()) |>
+  #For LPV Assessment Need to Use Paired Measurements of TV and PBW
+  mutate(eligible_lpv=fifelse(
+    eligible_tv==1 & (!is.na(pplat_lpv) & !is.na(tv_pbw)), 1, 0
+  )) |>
+  group_by(cohort_id, eligible_lpv) |>
+  mutate(n_lpv_measures=fifelse(
+    eligible_lpv==1, n(), NaN
+  )) |>
+  group_by(cohort_id, eligible_tv) |>
+  mutate(n_tv_eligible=fifelse(
+    !is.na(tv_lpv) & eligible_tv==1, n(), NaN
+  )) |>
+  mutate(n_pplat_eligible=fifelse(
+    !is.na(pplat_lpv) & eligible_tv==1, n(), NaN
+  )) |>
+  group_by(cohort_id) |>
+  fill(n_lpv_measures, n_tv_eligible, n_pplat_eligible, .direction = 'updown') |>
+  ungroup() |>
+  mutate(n_tv_eligible=fifelse(
+    is.na(n_tv_eligible), 0, n_tv_eligible
+  )) |>
+  mutate(n_pplat_eligible=fifelse(
+    is.na(n_pplat_eligible), 0, n_pplat_eligible
+  ))
+
+#For the Patients With no Eligible PPlat Can Use Ppeak 
+cat('\n Patients with no Eligible PPlat in 1st 24 hours:\n')
+cat(length(unique(vent24_outcomes$cohort_id[vent24_outcomes$n_pplat_eligible==0])), 'patients \n')
+cat('\n Patients with no Eligible LPV Measures in 1st 24 hours:\n')
+cat(length(unique(vent24_outcomes$cohort_id[is.na(vent24_outcomes$n_lpv_measures)])), 'patients \n')
+
+#Use Ppeak
+vent24_outcomes <- vent24_outcomes |>
+  #Keep Track of the Pplats in Which We Use PPeak Imputation
+  mutate(pplat_imp_ppeak=fcase(
+    eligible_tv==1 & is.na(n_lpv_measures), peak_inspiratory_pressure_obs
+  )) |>
+  #IF Pplat is Missing and It Was Otherwise an Eligible Measure Use the Ppeak Imputation
+  mutate(pplat_lpv=fifelse(
+    !is.na(pplat_imp_ppeak) & is.na(pplat_lpv), pplat_imp_ppeak, pplat_lpv
+  )) 
+
+#1 Patient Who Only Has 1 Pplat but Is Recorded at the Same Time as lpv_time_24 meaning there are 0 minutes of that included, Will Fix Here
+vent24_outcomes <- vent24_outcomes |>
+  mutate(temp=fifelse(
+    cohort_id=='CRI0ucu5zrau7g' & mode_name=='PRVC', peak_inspiratory_pressure_obs, NaN)) |>
+  mutate(pplat_lpv=fifelse(!is.na(temp), temp, pplat_lpv)) |>
+  select(-temp)
+
+#Redefine Eligible LPV and Recount the Numbers
+vent24_outcomes <- vent24_outcomes |>
+  mutate(eligible_lpv=fifelse(
+    eligible_tv==1 & (!is.na(pplat_lpv) & !is.na(tv_pbw)), 1, 0
+  )) |>
+  group_by(cohort_id, eligible_lpv) |>
+  mutate(n_lpv_measures=fifelse(
+    eligible_lpv==1, n(), NaN
+  )) |>
+  group_by(cohort_id) |>
+  fill(n_lpv_measures, .direction = 'updown') |>
+  ungroup() |>
+  mutate(n_lpv_measures=fifelse(
+    is.na(n_lpv_measures), 0, n_lpv_measures
+  ))
+
+#After Imputation Counts
+cat('\n In Patients with no Eligible PPlat in 1st 24 hours, We Used PPeak and After That Imputation There were:\n')
+cat(length(unique(vent24_outcomes$cohort_id[vent24_outcomes$n_lpv_measures>=1])), 'patients with LPV measures for Analysis \n')
+cat('\n Patients with no Eligible LPV Measures in 1st 24 hours:\n',length(unique(vent24_outcomes$cohort_id[vent24_outcomes$n_lpv_measures==0])))
+
+#Comparison of 'Imputed PPlat' and 'Recorded Pplat'
+cat('\n Recorded PPlat During Eligible Measurements \n')
+summary(vent24_outcomes$pplat_lpv[(is.na(vent24_outcomes$pplat_imp_ppeak) & vent24_outcomes$eligible_lpv==1)])
+cat('\n Ppeak Substitutin During PPlat During Eligible Measurements \n')
+summary(vent24_outcomes$pplat_imp_ppeak)
+
+cat('\n Of ventilator observations,\n ', dim(vent24_outcomes[vent24_outcomes$eligible_lpv == 1, ])[1], 'met criteria for LPV analysis,\n')
+cat(' ', dim(vent24_analytic[vent24_analytic$eligible_tv == 1, ])[1], 'met criteria for TV analysis, and \n')
+cat(' ', dim(vent24_analytic[(vent24_analytic$eligible_tv == 1 & !is.na(vent24_analytic$pplat_lpv)), ])[1], 'met criteria for Pplat analysis in this study. \n')
+
+cat('\n Summary Statistics for Number of Eligible Measures Per Participant')
+cat('\n Tidal Volume Measures Per Participant (1st 24 Hours) \n')
+summary(vent24_outcomes$n_tv_eligible)
+cat('\n Number of Pplat Measures Per Participant (1st 24 Hours) \n')
+summary(vent24_outcomes$n_pplat_eligible)
+cat('\n Number of LPV Measures Per Participant (1st 24 Hours) \n')
+summary(vent24_outcomes$n_lpv_measures)
+
+cat('\n Patients Included in the Primary LPV Analysis:\n')
+cat(length(unique(vent24_outcomes$cohort_id[vent24_outcomes$n_lpv_measures>=1])), 'patients \n')
+
+#Keep Track of Modes While TV Eligible
+cat('\n Ventilator Modes During TV Eligible Periods:\n')
+PercTable(table(vent24_outcomes$mode_name[vent24_outcomes$eligible_tv==1]), rfrq = '001')
+
+cat('\n Ventilator Modes During Any Period in 1st 24 Hours\n')
+PercTable(table(vent24_outcomes$mode_name), rfrq = '001')
+```
+
+#Below will Calculate LPV Outcomes.
+Primary: 
+- % Eligible Time with TV <= 6.5 cc/kg-IBW and Pplat <=30 in 1st 24 hours
+Secondary: 
+-Restrictive definition: % Eligible Time with TV <= 6.5 cc/kg-IBW and Pplat <=30 in 1st 24 hours AND if pplat>30 than Vt needs to be <6.0 cc/kgIBW
+- Hours spent with Vt>=8cc/kg IBW in 1st 24-hours of MV
+Descriptive:
+-Time-weighted TV, Time-weighted PEEP, TIme-weighted PPlat, Time-weighted Driving Pressure
+```{r Further Process LPV Outcomes}
+#Calculate Time Spent With Each Measurement
+vent24_outcomes <- vent24_outcomes |>
+  #Calculate Total TIme Observed by 24 Hours Per Patient
+  group_by(cohort_id) |>
+  mutate(time_at_measure=fcase(
+    row_number()!=n(), as.duration(lead(recorded_time)-recorded_time)/dhours(1), #Time to Next Observation
+    row_number()==n(), as.duration(lpv_end_24hours-recorded_time)/dhours(1) #If last observation Time to End of 24 Hour Period
+  )) |>
+  mutate(total_time_observed24=sum(time_at_measure)) |>
+  #Carry Forward PEEP
+  mutate(peep_extrapolated=peep_set) |>
+  fill(peep_extrapolated, .direction= 'downup') |>
+  #Now Total LPV Eligible Time
+  mutate(eligible_lpv_time=fcase(
+    eligible_lpv==1 | eligible_tv==0, 1, #To calculate time from paired TV/PPlat measurements to next. IF measure not eligible for TV measurement (not on controlled mode) time stops until next measurement is eligible
+    eligible_lpv==0 & eligible_tv==1, 2
+  )) |>
+  group_by(cohort_id, eligible_lpv_time) |>
+  mutate(time_at_lpv_measure=fcase(
+    row_number()!=n(), as.duration(lead(recorded_time)-recorded_time)/dhours(1), #Time to Next Observation
+    row_number()==n(), as.duration(lpv_end_24hours-recorded_time)/dhours(1) #If last observation Time to End of 24 Hour Period
+  )) |>
+  #Now Sum For Each Patient
+  group_by(cohort_id, eligible_lpv) |>
+  mutate(time_lpv_eligible24=fcase(
+    eligible_lpv_time==1 & eligible_tv==1, sum(time_at_lpv_measure),
+    default = NaN
+  )) |>
+  #Now Can Sum Time at TV
+  group_by(cohort_id, eligible_tv) |>
+  mutate(time_tv_eligible24=fcase(
+    eligible_tv==1, sum(time_at_measure)
+  )) |>
+  #Total TV Eligible Time (NOTE: For Pplat Can Use Total LPV Time)
+  group_by(cohort_id) |>
+  fill(time_tv_eligible24, time_lpv_eligible24, .direction='updown') |>
+  ungroup()
+
+cat('\n Time (hours) per Patient Available for LPV Analysis [This will be the Same for Driving Pressure and PEEP \n')
+summary(vent24_outcomes$time_lpv_eligible24[vent24_outcomes$n_lpv_measures>0])
+hist(vent24_outcomes$time_lpv_eligible24[vent24_outcomes$n_lpv_measures>0])
+
+cat('\n Time (hours) per Patient Available for TV Analysis \n')
+summary(vent24_outcomes$time_tv_eligible24[vent24_outcomes$n_tv_eligible>0])
+hist(vent24_outcomes$time_tv_eligible24[vent24_outcomes$n_tv_eligible>0])
+
+#Pimary Outcome: Percentage of Time At LPV
+vent24_outcomes <- vent24_outcomes |>
+  mutate(met_lpv=fcase(
+    eligible_lpv==1 & tv_pbw<=6.5 & pplat_lpv<=30, 1,
+    eligible_lpv==1 & (tv_pbw>6.5 | pplat_lpv>30), 0
+  )) |>
+  #If patient Didn't Meet LPV THis Won't Be Included in Numerator so Numerator is Time LPV Met and Denominator is Total Eligible Time
+  group_by(cohort_id) |>
+  mutate(hours_at_lpv=sum((met_lpv*time_at_lpv_measure), na.rm=TRUE)) |>
+  mutate(percent_lpv=
+           hours_at_lpv/time_lpv_eligible24) |>
+  #Repeat With Restricted Definition
+  mutate(met_lpv_restrict=fcase(
+    eligible_lpv==1 & tv_pbw<=6.5 & pplat_lpv<=30, 1,
+    eligible_lpv==1 & tv_pbw<6.0 & pplat_lpv>30, 1,
+    eligible_lpv==1 & (tv_pbw>6.5 | (tv_pbw>=6.0 & pplat_lpv>30)), 0
+  )) |>
+  #If patient Didn't Meet LPV THis Won't Be Included in Numerator so Numerator is Time LPV Met and Denominator is Total Eligible Time
+  group_by(cohort_id) |>
+  mutate(hours_at_lpv_restrict=sum((met_lpv_restrict*time_at_lpv_measure), na.rm=TRUE)) |>
+  mutate(percent_lpv_restrict=
+           hours_at_lpv_restrict/time_lpv_eligible24) |>
+  ungroup()
+
+#Secondary Outcome Hours (%) of Time Spent with TV >8.0 in 1st 24 Hours, TV > 7 in 1st 24 Hours, TV > 6.5 in 1st 24 Hours
+#Now Create Time-weighted TV, PEEP and Driving Pressure Measures
+vent24_outcomes <- vent24_outcomes |>
+  mutate(tv_gt8=fcase(
+    eligible_tv==1 & tv_pbw>8, 1,
+    eligible_tv==1 & tv_pbw<=8, 0
+  )) |>
+  group_by(cohort_id) |>
+  mutate(hours_tv_gt8=sum((tv_gt8*time_at_measure), na.rm=TRUE)) |>
+  mutate(percent_tv_gt8=
+           hours_tv_gt8/time_tv_eligible24) |>
+  #Repeat for TV of > 7
+  mutate(tv_gt7=fcase(
+    eligible_tv==1 & tv_pbw>7, 1,
+    eligible_tv==1 & tv_pbw<=7, 0
+  )) |>
+  group_by(cohort_id) |>
+  mutate(hours_tv_gt7=sum((tv_gt7*time_at_measure), na.rm=TRUE)) |>
+  mutate(percent_tv_gt7=
+           hours_tv_gt7/time_tv_eligible24) |>
+  #Repeat for TV of > 6.5
+  mutate(tv_gt6.5=fcase(
+    eligible_tv==1 & tv_pbw>6.5, 1,
+    eligible_tv==1 & tv_pbw<=6.5, 0
+  )) |>
+  group_by(cohort_id) |>
+  mutate(hours_tv_gt6.5=sum((tv_gt6.5*time_at_measure), na.rm=TRUE)) |>
+  mutate(percent_tv_gt6.5=
+           hours_tv_gt6.5/time_tv_eligible24) |>#Repeat for TV of > 6.5
+  #Repeat for TV 6
+  mutate(tv_gt6=fcase(
+    eligible_tv==1 & tv_pbw>6, 1,
+    eligible_tv==1 & tv_pbw<=6, 0
+  )) |>
+  group_by(cohort_id) |>
+  mutate(hours_tv_gt6=sum((tv_gt6*time_at_measure), na.rm=TRUE)) |>
+  mutate(percent_tv_gt6=
+           hours_tv_gt6/time_tv_eligible24) |>
+  ungroup()
+    
+#Now Time Weighted TV, Pplat, PEEP and Driving Pressure; Baseline Respiratory Compliance
+vent24_outcomes <- vent24_outcomes |>
+  #Start with Tidal Volume
+  group_by(cohort_id) |>
+  #Calculate Weighted Tidaly Volume = TV* (time observed/time eligible)
+  mutate(temp=fcase(
+    eligible_tv==1, tv_pbw*(time_at_measure/time_tv_eligible24)
+  )) |>
+  #Sum the Non Missing
+  mutate(tv_weighted24=sum(temp, na.rm=TRUE)) |>
+  mutate(tv_weighted24=round(tv_weighted24, digits = 1)) |>
+  #Repeat For Pplat (can use eligible_lpv for this Measure)
+  mutate(temp=fcase(
+    eligible_lpv==1, pplat_lpv*(time_at_lpv_measure/time_lpv_eligible24)
+  )) |>
+  #As Along As All Values ARe Not Missing Can Do Sum
+  mutate(pplat_weighted24=fcase(
+    sum(is.na(temp))!=n(), sum(temp, na.rm=TRUE))) |>
+  mutate(pplat_weighted24=round(pplat_weighted24, digits = 0)) |>
+  #Repeat For PEEP (can use eligible_tv for this Measure)
+  mutate(temp=fcase(
+    eligible_tv==1, peep_set*(time_at_measure/time_tv_eligible24)
+  )) |>
+  mutate(peep_weighted24=fcase(
+    sum(is.na(temp))!=n(), sum(temp, na.rm=TRUE))) |>
+  mutate(peep_weighted24=round(peep_weighted24, digits = 0)) |>
+  #Repeat For Driving Pressure (can use eligible_lpv for this Measure)
+  #Filter Out Physiologically Implausible Values (Driving Pressure > 2 allowed)
+  mutate(temp_dp=fifelse(
+    eligible_lpv==1 & (pplat_lpv-peep_extrapolated>2), 1, 0
+  )) |>
+  #Filter Out the Time That the Implausible Measures Take
+  mutate(temp_time=fcase(
+    temp_dp==1, time_at_lpv_measure
+  )) |>
+  mutate(temp_time=fcase(
+    sum(is.na(temp_time))!=n(), sum(temp_time, na.rm = TRUE))) |>
+  mutate(temp=fcase(
+    temp_dp==1, (pplat_lpv-peep_extrapolated) *(time_at_lpv_measure/temp_time)
+  )) |>
+  mutate(dp_weighted24=fcase(
+    sum(is.na(temp))!=n(), sum(temp, na.rm=TRUE))) |>
+  mutate(dp_weighted24=round(dp_weighted24, digits = 0)) |>
+  select(-temp_dp, -temp_time) |>
+  ungroup()
+
+#For Purposes of Comparison to Other Metrics Get First TV, Mean TV and Median TV
+vent24_outcomes <- vent24_outcomes |>
+  group_by(cohort_id, eligible_tv) |>
+  mutate(tv_first=fcase(
+    eligible_tv==1 & row_number()==1, tv_pbw
+  )) |>
+  mutate(tv_mean24=fcase(
+    eligible_tv==1, mean(tv_pbw, na.rm = TRUE)
+  )) |>
+  mutate(tv_median24=fcase(
+    eligible_tv==1, median(tv_pbw, na.rm = TRUE)
+  )) |>
+  group_by(cohort_id) |>
+  fill(tv_first, tv_mean24, tv_median24, .direction = 'updown') |>
+  relocate(tv_first, tv_mean24, tv_median24, .after = tv_weighted24)
+  
+#Calculate Baseline Respiratory Compliance
+vent24_outcomes <- vent24_outcomes |>
+  #Redefine Eligible Measurements, Will Exclude When PPlat-PEEP<3 as these are outlier not physiologic values
+  mutate(temp=fifelse(
+    eligible_lpv==1 & (pplat_lpv-peep_extrapolated>2), 1, 0
+  )) |>
+  group_by(cohort_id, temp) |>
+  mutate(resp_compliance_baseline=fcase(
+    row_number()==1 & temp==1, tv_lpv/(pplat_lpv-peep_extrapolated)
+  )) |>
+  mutate(resp_compliance_baseline=round(resp_compliance_baseline, digits = 1)) |>
+  group_by(cohort_id) |>
+  fill(resp_compliance_baseline, .direction = 'updown') |>
+  ungroup() 
+```
+
+
+```{r Create Summary Vent Table}
+#First 'Long Form' Table
+#Select Wanted Variables and Format
+vent24_outcomes <- vent24_outcomes |>
+  select(cohort_id, recorded_time, mode_category:ecmo_type, eligible_mode:resp_compliance_baseline, -temp) |>
+  relocate(encounter_block, study_vent_start:lpv_end_24hours, .after = cohort_id)
+
+#Create a Summary Table
+vent24_outcome_summary <- vent24_outcomes |>
+  #Get Vent Modes (For Description)
+  mutate(mode_miss=fifelse(is.na(mode_category),1, 0)) |>
+  group_by(cohort_id, mode_miss, eligible_tv) |>
+  mutate(first_vent_mode=fcase(
+    mode_miss==0 & row_number()==1 & eligible_tv==1, mode_name
+  )) |>
+  group_by(cohort_id) |>
+  fill(first_vent_mode, .direction = 'updown') |>
+  #Most Common Mode
+  group_by(cohort_id, mode_name, mode_miss, eligible_tv) |>
+  mutate(temp=fcase(
+    mode_miss==0 & eligible_tv==1, n())) |>
+  group_by(cohort_id) |>
+  mutate(most_mode_tv_eligible=fcase(
+    temp==max(temp, na.rm=TRUE), mode_name
+  )) |>
+  fill(most_mode_tv_eligible, .direction = c('downup')) |>
+  ungroup()
+
+#Select Wanted Variables and Select First Row
+vent24_outcome_summary <- vent24_outcome_summary |>
+  group_by(cohort_id, encounter_block) |>
+  filter(row_number()==1) |>
+  select(cohort_id, encounter_block, n_vent_observations, n_lpv_measures, n_tv_eligible, n_pplat_eligible, total_time_observed24, 
+         time_lpv_eligible24, time_tv_eligible24, hours_at_lpv, percent_lpv, hours_at_lpv_restrict, percent_lpv_restrict, hours_tv_gt8, 
+         percent_tv_gt8, hours_tv_gt7, percent_tv_gt7, hours_tv_gt6.5, percent_tv_gt6.5, hours_tv_gt6, percent_tv_gt6,
+         tv_weighted24:resp_compliance_baseline, first_vent_mode, most_mode_tv_eligible) |>
+  ungroup()
+
+#Round the Time and Percent Variables
+vars <- names(vent24_outcome_summary)[7:21]
+vent24_outcome_summary <- vent24_outcome_summary |>
+  mutate(across(
+    all_of(vars),
+    ~ round(., 2)
+  ))
+
+```
+
+
+```{r Prepare Study ICU Names so Unit Scores Can be Merged With The Clinical Data}
+PercTable(table(lpv_analytic$icu_vent), rfrq = '001')
+PercTable(table(survey_unit_level$primary_icu.factor), rfrq = '001')
+
+#Create Mapping of ICU Names
+survey_unit_level <- survey_unit_level |>
+  mutate(study_icu=fcase(
+    primary_icu.factor=='JHH CCU, 5W', 'JHH ZAYED 5W',
+    primary_icu.factor =='JHH CVSICU, 5E', 'JHH ZAYED 5E',
+    primary_icu.factor =='JHH MICU, 10E', 'JHH ZAYED 10E',
+    primary_icu.factor =='JHH NCCU, 3W', 'JHH ZAYED 3W',
+    primary_icu.factor=='JHH WICU, Weinberg 3A', 'JHH WEINBERG 3A',
+    primary_icu.factor=='JHH ONC ICU, Weinberg 5C', 'JHH WEINBERG 5C',
+    primary_icu.factor=='JHH SICU, 9E', 'JHH ZAYED 9E',
+    primary_icu.factor=='Sibley Memorial ICU', 'SMH ICU',
+    primary_icu.factor=='Suburban 3100 ICU', 'SH 3100 INTENSIVE CARE',
+    primary_icu.factor=='Suburban 3400 ICU', 'SH 3400 INTENSIVE CARE'
+  )) |>
+  mutate(study_icu=fifelse(is.na(study_icu), primary_icu.factor, study_icu)) |>
+  select(-primary_icu.factor)
+
+#Prepare LPV Analytic For Merging
+lpv_analytic <- lpv_analytic |>
+  mutate(study_icu=fcase(
+    icu_vent=='SMH 2B ICU' | icu_vent=='ZDEAC SMH ICU', 'SMH ICU'
+  )) |>
+  mutate(study_icu=fifelse(
+    is.na(study_icu), icu_vent, study_icu
+  )) |>
+  relocate(study_icu, .before = icu_vent)
+
+#Merge in Unit Level Data to LPV Analytic
+lpv_analytic <- lpv_analytic |>
+  left_join(survey_unit_level)
+```
+
+
+```{r Create CCSR Categories for Analysis}
+#Create List of Distinct CCSR Diagnosis Categories
+ccsr_categories <- lpv_analytic |>
+  select(ccsr_body_system, ccsr_category) |>
+  group_by(ccsr_category) |>
+  mutate(n_category=n()) |>
+  ungroup() |>
+  distinct() |>
+  arrange(-n_category)
+
+ccsr_system <- lpv_analytic |>
+  select(ccsr_body_system) |>
+  group_by(ccsr_body_system) |>
+  mutate(n_category=n()) |>
+  ungroup() |>
+  distinct() |>
+  arrange(-n_category) |>
+  #Create Categorical Variable of Top 5 Systems
+  mutate(ccsr_system_cat=fcase(
+    ccsr_body_system=='Diseases of the circulatory system', 'Circulatory',
+    ccsr_body_system=='Diseases of the respiratory system', 'Respiratory',
+    ccsr_body_system %in% c('Injury, poisoning and certain other consequences of external causes',
+                            'External causes of morbidity'), 'Trauma or Poisoning',
+    ccsr_body_system=='Diseases of the digestive system', 'Gastrointestinal',
+    ccsr_body_system=='Diseases of the nervous system', 'Neurologic',
+    ccsr_body_system=='Certain infectious and parasitic diseases', 'Infectious',
+    default = 'Other'
+  )) |>
+  select(-n_category)
+
+#Create Categorical Variable of Top 2 Diagnoses in Each Body System
+ccsr_categories <- ccsr_categories |>
+  mutate(dx_category=fcase(
+    ccsr_category=='Septicemia', 'Sepsis',
+    ccsr_category=='Coronavirus disease – 2019 (COVID-19)', 'COVID-19',
+    ccsr_category=='Cardiac arrest and ventricular fibrillation', 'Cardiac Arrest',
+    ccsr_category %in% 
+      c('Acute hemorrhagic cerebrovascular disease', 'Cerebral infarction',
+        'Nervous system signs and symptoms', 'Epilepsy; convulsions',	'Coma; stupor; and brain damage',
+        'Encephalitis'), 'Stroke, Seizure, Altered',
+    ccsr_category %in% 
+    c('Respiratory failure; insufficiency; arrest', 'Pneumonia (except that caused by tuberculosis)',
+      'Chronic obstructive pulmonary disease and bronchiectasis', 'Other specified and unspecified lower respiratory disease',
+      'Pleurisy, pleural effusion and pulmonary collapse',
+      'Aspiration pneumonitis',
+      'Asthma',
+      'Influenza',
+      'Acute bronchitis',
+      'Other specified upper respiratory infections', 
+      'Respiratory signs and symptoms'), 'Respiratory Failure and Pneumonia',
+    ccsr_body_system=='Neoplasms', 'Cancer Related',
+    ccsr_body_system=='External causes of morbidity', 'Trauma',
+    ccsr_category=='Acute and unspecified renal failure', 'Acute Renal Failure',
+    default = 'Other'
+  ))
+
+lpv_analytic <- lpv_analytic |>
+  left_join(ccsr_categories) |>
+  left_join(ccsr_system) |>
+  relocate(dx_category, .after = ccsr_category) |>
+  select(-n_category)
+PercTable(table(lpv_analytic$dx_category), rfrq = '001')
+```
+```{r Add in MV Volume Per Month}
+#Load MV Volume Data
+mv_volume <- open_dataset(paste0(project_path, '/data/volume_of_mv.parquet')) |>
+  collect()
+
+lpv_analytic <- lpv_analytic |>
+  mutate(year=year(lpv_time_zero)) |>
+  mutate(month=month(lpv_time_zero)) |>
+  mutate(study_month=fcase(
+    year=='2022', month-6,
+    year=='2023', month+6,
+    year=='2024', month+18
+  )) |>
+  left_join(mv_volume) |>
+  relocate(year, month, study_month, mv_volume_month, .after = lpv_time_zero)
+
+```
+
+```{r Create Study SF and PF Ratio}
+#Will Use Pre Vent SF Ratios and IF Missing Post Vent SF Ratios
+
+#For Defining PFs, can Use Following Hierarchy
+#Define the P/F Ratio to Use for Adjustment Variable
+#Hierarchy is: 1) Pre-vent Pao2/FiO2, 2) if that is missing the imputed pre-vent Pao2/FiO2, 3)if that is missing the Post vent PF, 4) if that is missing the imputed post vent PF
+#At Each Step Describe Missingness
+pf_process <- lpv_analytic |>
+  mutate(pf_ratio=fcase(
+    !is.na(pre_vent_pf) & pre_vent_pf<=300, pre_vent_pf
+  )) 
+n_pfs <- sum(!is.na(pf_process$pf_ratio))
+cat('There were', n_pfs, 'qualifying PaO2/FiO2 ratios from 24 hour prior to vent \n')
+
+#Calculate Imputed PaO2, note the Spo2 and sf_fio2 used pre vent variables if avaiable and otherwise post vent
+sp2_pao2_imputation <- function(x) {
+  a <- x %>%
+    mutate(S=fifelse(spo2<97, spo2/100, NaN)) %>%
+    mutate(a=
+             11700/(1/S-1)
+    ) %>%
+    mutate(b =
+             ((50^3+a^2)^0.5)
+             ) %>%
+    mutate(pao2_imputed = 
+             (b+a)^0.33 - (b-a)^0.33
+    ) %>%
+    select(-a, -b, -S) |>
+    mutate(pf_imputed=pao2_imputed/(sf_fio2/100)) |>
+    relocate(pao2_imputed, pf_imputed, .after = pf_ratio)
+}
+pf_process <- sp2_pao2_imputation(pf_process) |>
+  mutate(sf_ratio=fifelse(!is.na(pre_vent_sf), pre_vent_sf, post_vent_sf)) |>
+  mutate(pf_ratio=fifelse(is.na(pf_ratio) & !is.na(pre_vent_sf), pf_imputed, pf_ratio)) #Only Uses Imputed Pre-Vent Variables
+
+#Keep Track of What Was Imputed
+cat('There were', sum(!is.na(pf_process$pf_ratio))-n_pfs, 'PaO2/FiO2 ratios using imputed data from 24 hour prior to vent \n')
+cat('There were still', sum(is.na(pf_process$pf_ratio)), 'missing Pao2/FiO2 ratios \n')
+n_pfs <- sum(!is.na(pf_process$pf_ratio))
+
+pf_process <- sp2_pao2_imputation(pf_process) |>
+  mutate(pf_ratio=fifelse(is.na(pf_ratio) & post_vent_pf<=300, post_vent_pf, pf_ratio)) 
+
+cat('There were', sum(!is.na(pf_process$pf_ratio))-n_pfs, 'PaO2/FiO2 ratios directly measured in the first 12 hours after vent \n')
+cat('There were still', sum(is.na(pf_process$pf_ratio)), 'missing Pao2/FiO2 ratios \n')
+n_pfs <- sum(!is.na(pf_process$pf_ratio))
+
+pf_process <- pf_process |>
+  mutate(pf_ratio=fifelse(is.na(pf_ratio), pf_imputed, pf_ratio)) #Finally Takes Post Vent Imputed PF
+cat('There were', sum(!is.na(pf_process$pf_ratio))-n_pfs, 'PaO2/FiO2 ratios imputed from SpO2/Fio2 in the first 12 hours after vent \n')
+cat('There were still', sum(is.na(pf_process$pf_ratio)), 'missing Pao2/FiO2 ratios \n')
+
+#Finally Describe the Pre and Post Use
+pf_process <- pf_process |>
+  mutate(pre_qualify=fifelse(!is.na(pre_vent_sf) | (!is.na(pre_vent_pf) & pre_vent_pf<=300), "Pre-Vent Data", "Post-Vent Data"))
+
+cat('Table Showing Who Qualified (For Oxygenation Puposes) Using 24 hour data prior to ventilator or up to 12 hours after ventilator')
+PercTable(table(pf_process$pre_qualify))
+
+pf_process <- pf_process |>
+  select(cohort_id, encounter_block, pf_ratio, sf_ratio, pre_qualify)
+
+#Merge into LPV Analytic
+lpv_analytic <- lpv_analytic |>
+  left_join(pf_process) |>
+  relocate(pf_ratio:pre_qualify, .after = mv_volume_month)
+```
+
+```{r Process SOFA Scores}
+sofa_process <- lpv_analytic |> 
+  select(cohort_id, encounter_block, max_cns_sofa:max_renal_sofa, lpv_time_zero) |>
+  relocate(lpv_time_zero, .after = encounter_block) |>
+  mutate(max_nr_sofa =
+           rowSums(across(starts_with("max_cns_sofa"):starts_with("max_renal_sofa"))))
+                   
+p_missing <- unlist(lapply(sofa_process[4:9], function(x)
+  sum(is.na(x))))/nrow(sofa_process)
+n_missing <- unlist(lapply(sofa_process[4:9], 
+                           function(x) sum(is.na(x))))
+missing <- data.frame("N Missing" = n_missing, 
+                 "Percent Missing" = p_missing)
+print('Missinginess in SOFA Scores [Before Liver Imputation]')
+missing
+
+#Will Use Values from the 48 Hours Prior to 48 hours after LPV Time Zero for the 91 patients Missing SoFA scores
+temp <- sofa_process |> filter(is.na(max_nr_sofa)) |>
+  select(cohort_id, lpv_time_zero, max_coag_sofa, max_liver_sofa, max_cns_sofa)
+missing_sofa <- open_dataset(paste0(project_path, '/data/lpv_master_sofa.parquet')) |> 
+  filter(cohort_id %in% temp$cohort_id) |> 
+  #Only Missing Values are In Bilirubin and Platelets, Filter to Those Labs Only, ONLY when A Patient Is Missing That Vlaue
+  filter(lab_name=='bilirubin_total' | lab_name=='platelet_count' | !is.na(cns_sofa)) |>
+  left_join(temp) |>
+  filter((!is.na(coag_sofa) & is.na(max_coag_sofa)) | (!is.na(liver_sofa) & is.na(max_liver_sofa)) |
+           (!is.na(cns_sofa) & is.na(max_cns_sofa))) |>
+  collect() |>
+  mutate(time_to_lpv=as.duration(recorded_time-lpv_time_zero)) |>
+  filter(time_to_lpv>=ddays(-2) & time_to_lpv<=ddays(2)) |>
+  mutate(liver=fifelse(is.na(liver_sofa), 0, 1)) |> #INdicates whether platelet or liver
+  mutate(before_vent=fifelse(time_to_lpv<=ddays(0), 1, 0)) |>
+  group_by(cohort_id, before_vent) |>
+  mutate(templiver_sofa_max=max(liver_sofa, na.rm = TRUE)) |>
+  mutate(tempcoag_sofa_max=max(coag_sofa, na.rm = TRUE)) |>
+  mutate(tempcns_sofa_max=max(cns_sofa, na.rm = TRUE)) |>
+  group_by(cohort_id) |>
+  #Use Max Value Before Vent if Available
+  mutate(liver_sofa_max=fifelse(before_vent==1, templiver_sofa_max, NaN)) |>
+  mutate(coag_sofa_max=fifelse(before_vent==1, tempcoag_sofa_max, NaN)) |>
+  mutate(cns_sofa_max=fifelse(before_vent==1, tempcns_sofa_max, NaN)) |>
+  fill(liver_sofa_max, coag_sofa_max, cns_sofa_max, .direction = 'updown') |>
+  #Can Use Max Value After Vent if Not Available
+  mutate(liver_sofa_max=fifelse(is.na(liver_sofa_max), templiver_sofa_max, liver_sofa_max)) |>
+  mutate(coag_sofa_max=fifelse(is.na(coag_sofa_max), tempcoag_sofa_max, coag_sofa_max)) |>
+  mutate(cns_sofa_max=fifelse(is.na(cns_sofa_max), tempcns_sofa_max, cns_sofa_max)) |>
+  fill(liver_sofa_max, coag_sofa_max, cns_sofa_max, .direction = 'updown') |>
+  filter(row_number()==1) |>
+  select(cohort_id, liver_sofa_max, coag_sofa_max, cns_sofa_max)
+
+#Join Back with SOFA Scores 
+sofa_process <- sofa_process |>
+  left_join(missing_sofa) |>
+  mutate(max_liver_sofa=fifelse(is.na(max_liver_sofa), liver_sofa_max, max_liver_sofa)) |>
+  mutate(max_coag_sofa=fifelse(is.na(max_coag_sofa), coag_sofa_max, max_coag_sofa)) |>
+  mutate(max_cns_sofa=fifelse(is.na(max_cns_sofa), cns_sofa_max, max_cns_sofa)) |>
+  select(-liver_sofa_max, -coag_sofa_max, -cns_sofa_max) |>
+  mutate(max_nr_sofa =
+           rowSums(across(starts_with("max_cns_sofa"):starts_with("max_renal_sofa"))))
+#Describe Missing
+p_missing <- unlist(lapply(sofa_process[4:9], function(x)
+  sum(is.na(x))))/nrow(sofa_process)
+n_missing <- unlist(lapply(sofa_process[4:9], 
+                           function(x) sum(is.na(x))))
+missing <- data.frame("N Missing" = n_missing, 
+                 "Percent Missing" = p_missing)
+print('Missinginess in SOFA Scores [After Using 48 Before Window > 48 Hour After Window]')
+missing
+
+#Impute Missing Liver SOFA as Normal
+sofa_process <- sofa_process |> 
+  mutate(max_liver_sofa = fifelse(is.na(max_liver_sofa), 0, max_liver_sofa)) |>
+  mutate(max_nr_sofa =
+           rowSums(across(starts_with("max_cns_sofa"):starts_with("max_renal_sofa"))))
+
+p_missing <- unlist(lapply(sofa_process[4:9], function(x)
+  sum(is.na(x))))/nrow(sofa_process)
+n_missing <- unlist(lapply(sofa_process[4:9], 
+                           function(x) sum(is.na(x))))
+missing <- data.frame("N Missing" = n_missing, 
+                 "Percent Missing" = p_missing)
+print('Missinginess in SOFA Scores [After Liver Imputation]')
+missing
+
+#Merge Back with LPV analytic
+sofa_process <- sofa_process |> select(cohort_id, max_cns_sofa:max_nr_sofa)
+lpv_analytic <- lpv_analytic |>
+  select(-max_cns_sofa, -max_cv_sofa, -max_liver_sofa, -max_coag_sofa, -max_renal_sofa) |>
+  left_join(sofa_process) |>
+  relocate(max_cns_sofa:max_nr_sofa, .after=weight_kg) |>
+  mutate(max_nr_sofa=fifelse(is.finite(max_nr_sofa), max_nr_sofa, NaN))
+```
+
+
+```{r Finally Add Vent 24 Outcomes to LPV Analytic File}
+lpv_analytic <- lpv_analytic |>
+  left_join(vent24_outcome_summary)
+```
+
+```{r Repeat Ventilator Outcomes for Vent Day 2}
+#Primary: % Eligible Time with TV <= 6.5 cc/kg-IBW and Pplat <=30 Between Hours 24 and 48
+#Need to Calculate Time At LPV and Denominator of Eligible Time
+#Additionally Calculate Components (time-weighted VT per kg IBW and time-weighted PPlat)
+
+#Track Numbers of Observations for Description in the Paper
+cat("\n In the analytic cohort there were,", dim(vent72_analytic)[1], "observed ventilator settings in the first 72 hours")
+
+vent24_48_outcomes <- vent72_analytic |> collect() |>
+  #Create an End Time for LPV Assessment at 48 Hours (the earliest of ventilator end or 48 hours after lpv time zero)
+  mutate(time_48hours=lpv_time_zero+dhours(48)) |>
+  mutate(day2_start=lpv_time_zero+dhours(24)) |>
+  mutate(lpv_end_48hours=fifelse(
+      time_48hours<=study_vent_end, time_48hours, study_vent_end)) |>
+  mutate(lpv_end_48hours=fifelse(
+    study_vent_end<day2_start, day2_start, lpv_end_48hours)) |>
+  select(-time_48hours) |>
+  filter(recorded_time>day2_start & recorded_time<=lpv_end_48hours)
+  
+vent24_48_outcomes <- vent24_48_outcomes |>
+  #How Many Ventilator Measurements on Day 2
+  group_by(cohort_id) |>
+  mutate(n_vent_observations=n()) |>
+  #For LPV Assessment Need to Use Paired Measurements of TV and PBW
+  mutate(eligible_lpv=fifelse(
+    eligible_tv==1 & (!is.na(pplat_lpv) & !is.na(tv_pbw)), 1, 0
+  )) |>
+  group_by(cohort_id, eligible_lpv) |>
+  mutate(n_lpv_measures=fifelse(
+    eligible_lpv==1, n(), NaN
+  )) |>
+  group_by(cohort_id, eligible_tv) |>
+  mutate(n_tv_eligible=fifelse(
+    !is.na(tv_lpv) & eligible_tv==1, n(), NaN
+  )) |>
+  mutate(n_pplat_eligible=fifelse(
+    !is.na(pplat_lpv) & eligible_tv==1, n(), NaN
+  )) |>
+  group_by(cohort_id) |>
+  fill(n_lpv_measures, n_tv_eligible, n_pplat_eligible, .direction = 'updown') |>
+  ungroup() |>
+  mutate(n_tv_eligible=fifelse(
+    is.na(n_tv_eligible), 0, n_tv_eligible
+  )) |>
+  mutate(n_pplat_eligible=fifelse(
+    is.na(n_pplat_eligible), 0, n_pplat_eligible
+  ))
+
+#For the Patients With no Eligible PPlat Can Use Ppeak 
+cat('\n Patients with no Eligible PPlat on Day 2:\n')
+cat(length(unique(vent24_48_outcomes$cohort_id[vent24_48_outcomes$n_pplat_eligible==0])), 'patients \n')
+cat('\n Patients with no Eligible LPV Measures in 1st 24 hours:\n')
+cat(length(unique(vent24_48_outcomes$cohort_id[is.na(vent24_48_outcomes$n_lpv_measures)])), 'patients \n')
+
+#Use Ppeak
+vent24_48_outcomes <- vent24_48_outcomes |>
+  #Keep Track of the Pplats in Which We Use PPeak Imputation
+  mutate(pplat_imp_ppeak=fcase(
+    eligible_tv==1 & is.na(n_lpv_measures), peak_inspiratory_pressure_obs
+  )) |>
+  #IF Pplat is Missing and It Was Otherwise an Eligible Measure Use the Ppeak Imputation
+  mutate(pplat_lpv=fifelse(
+    !is.na(pplat_imp_ppeak) & is.na(pplat_lpv), pplat_imp_ppeak, pplat_lpv
+  )) 
+
+#Redefine Eligible LPV and Recount the Numbers
+vent24_48_outcomes <- vent24_48_outcomes |>
+  mutate(eligible_lpv=fifelse(
+    eligible_tv==1 & (!is.na(pplat_lpv) & !is.na(tv_pbw)), 1, 0
+  )) |>
+  group_by(cohort_id, eligible_lpv) |>
+  mutate(n_lpv_measures=fifelse(
+    eligible_lpv==1, n(), NaN
+  )) |>
+  group_by(cohort_id) |>
+  fill(n_lpv_measures, .direction = 'updown') |>
+  ungroup() |>
+  mutate(n_lpv_measures=fifelse(
+    is.na(n_lpv_measures), 0, n_lpv_measures
+  ))
+
+#After Imputation Counts
+cat('\n In Patients with no Eligible PPlat on Day 2, We Used PPeak and After That Imputation There were:\n')
+cat(length(unique(vent24_48_outcomes$cohort_id[vent24_48_outcomes$n_lpv_measures>=1])), 'patients with LPV measures for Analysis \n')
+cat('\n Patients with no Eligible LPV Measures on Day 2:\n',length(unique(vent24_48_outcomes$cohort_id[vent24_48_outcomes$n_lpv_measures==0])))
+
+#Comparison of 'Imputed PPlat' and 'Recorded Pplat'
+cat('\n Recorded PPlat During Eligible Measurements \n')
+summary(vent24_48_outcomes$pplat_lpv[(is.na(vent24_48_outcomes$pplat_imp_ppeak) & vent24_48_outcomes$eligible_lpv==1)])
+cat('\n Ppeak Substitutin During PPlat During Eligible Measurements \n')
+summary(vent24_48_outcomes$pplat_imp_ppeak)
+```
+
+```{r Create LPV Measures for Day 2 (Hours 24-48)}
+#Calculate Time Spent With Each Measurement
+vent24_48_outcomes <- vent24_48_outcomes |>
+  #Calculate Total Time Observed on Day 2 Per Patient
+  group_by(cohort_id) |>
+  mutate(time_at_measure=fcase(
+    row_number()!=n(), as.duration(lead(recorded_time)-recorded_time)/dhours(1), #Time to Next Observation
+    row_number()==n(), as.duration(lpv_end_48hours-recorded_time)/dhours(1), #If last observation Time to End of 48 Hour Period
+    recorded_time==study_vent_end, 0 #If the Last Observation is the Time of Vent End Will Call it 0 Hours *Which means exclude
+  )) |>
+  mutate(total_time_observed48=sum(time_at_measure)) |>
+  #Carry Forward PEEP
+  mutate(peep_extrapolated=peep_set) |>
+  fill(peep_extrapolated, .direction= 'downup') |>
+  #Now Total LPV Eligible Time
+  mutate(eligible_lpv_time=fcase(
+    eligible_lpv==1 | eligible_tv==0, 1, #To calculate time from paired TV/PPlat measurements to next. IF measure not eligible for TV measurement (not on controlled mode) time stops until next measurement is eligible
+    eligible_lpv==0 & eligible_tv==1, 2
+  )) |>
+  group_by(cohort_id, eligible_lpv_time) |>
+  mutate(time_at_lpv_measure=fcase(
+    row_number()!=n(), as.duration(lead(recorded_time)-recorded_time)/dhours(1), #Time to Next Observation
+    row_number()==n(), as.duration(lpv_end_48hours-recorded_time)/dhours(1) #If last observation Time to End of 48 Hour Period
+  )) |>
+  #Now Sum For Each Patient
+  group_by(cohort_id, eligible_lpv) |>
+  mutate(time_lpv_eligible48=fcase(
+    eligible_lpv_time==1 & eligible_tv==1, sum(time_at_lpv_measure),
+    default = NaN
+  )) |>
+  #Now Can Sum Time at TV
+  group_by(cohort_id, eligible_tv) |>
+  mutate(time_tv_eligible48=fcase(
+    eligible_tv==1, sum(time_at_measure)
+  )) |>
+  #Total TV Eligible Time (NOTE: For Pplat Can Use Total LPV Time)
+  group_by(cohort_id) |>
+  mutate(time_tv_eligible48=fifelse(time_tv_eligible48==0, NaN, time_tv_eligible48)) |> #For Those with No Tidal Volume Time to Contribute
+  mutate(time_lpv_eligible48=fifelse(time_lpv_eligible48==0, NaN, time_lpv_eligible48)) |>
+  fill(time_tv_eligible48, time_lpv_eligible48, .direction='updown') |>
+  ungroup()
+
+cat('\n Time (hours) per Patient Available for LPV Analysis on Day 2[This will be the Same for Driving Pressure and PEEP \n')
+summary(vent24_48_outcomes$time_lpv_eligible48[vent24_48_outcomes$n_lpv_measures>0])
+hist(vent24_48_outcomes$time_lpv_eligible48[vent24_48_outcomes$n_lpv_measures>0])
+
+cat('\n Time (hours) per Patient Available for TV Analysis on Day 2 \n')
+summary(vent24_48_outcomes$time_tv_eligible48[vent24_48_outcomes$n_tv_eligible>0])
+hist(vent24_48_outcomes$time_tv_eligible48[vent24_48_outcomes$n_tv_eligible>0])
+
+#Pimary Outcome: Percentage of Time At LPV
+vent24_48_outcomes <- vent24_48_outcomes |>
+  mutate(met_lpv=fcase(
+    eligible_lpv==1 & tv_pbw<=6.5 & pplat_lpv<=30, 1,
+    eligible_lpv==1 & (tv_pbw>6.5 | pplat_lpv>30), 0
+  )) |>
+  #If patient Didn't Meet LPV THis Won't Be Included in Numerator so Numerator is Time LPV Met and Denominator is Total Eligible Time
+  group_by(cohort_id) |>
+  mutate(hours_at_lpv_day2=sum((met_lpv*time_at_lpv_measure), na.rm=TRUE)) |>
+  mutate(percent_lpv_day2=
+           hours_at_lpv_day2/time_lpv_eligible48) |>
+  #Repeat With Restricted Definition
+  mutate(met_lpv_restrict=fcase(
+    eligible_lpv==1 & tv_pbw<=6.5 & pplat_lpv<=30, 1,
+    eligible_lpv==1 & tv_pbw<6.0 & pplat_lpv>30, 1,
+    eligible_lpv==1 & (tv_pbw>6.5 | (tv_pbw>=6.0 & pplat_lpv>30)), 0
+  )) |>
+  ungroup()
+
+#Secondary Outcome Hours (%) of Time Spent with TV >8.0 in 1st 24 Hours, TV > 7 on Day 2, TV > 6.5 on Day 2
+#Now Create Time-weighted TV, PEEP and Driving Pressure Measures
+vent24_48_outcomes <- vent24_48_outcomes |>
+  mutate(tv_gt8_day2=fcase(
+    eligible_tv==1 & tv_pbw>8, 1,
+    eligible_tv==1 & tv_pbw<=8, 0
+  )) |>
+  group_by(cohort_id) |>
+  mutate(hours_tv_gt8_day2=sum((tv_gt8_day2*time_at_measure), na.rm=TRUE)) |>
+  mutate(percent_tv_gt8_day2=
+           hours_tv_gt8_day2/time_tv_eligible48) |>
+  ungroup()
+    
+#Now Time Weighted TV, Pplat, PEEP and Driving Pressure; Baseline Respiratory Compliance
+vent24_48_outcomes <- vent24_48_outcomes |>
+  #Start with Tidal Volume
+  group_by(cohort_id) |>
+  #Calculate Weighted Tidal Volume = TV* (time observed/time eligible)
+  mutate(temp=fcase(
+    eligible_tv==1, tv_pbw*(time_at_measure/time_tv_eligible48)
+  )) |>
+  #Sum the Non Missing
+  mutate(tv_weighted_day2=sum(temp, na.rm=TRUE)) |>
+  mutate(tv_weighted_day2=round(tv_weighted_day2, digits = 1)) |>
+  #Repeat For Pplat (can use eligible_lpv for this Measure)
+  mutate(temp=fcase(
+    eligible_lpv==1, pplat_lpv*(time_at_lpv_measure/time_lpv_eligible48)
+  )) |>
+  #As Along As All Values ARe Not Missing Can Do Sum
+  mutate(pplat_weighted_day2=fcase(
+    sum(is.na(temp))!=n(), sum(temp, na.rm=TRUE))) |>
+  mutate(pplat_weighted_day2=round(pplat_weighted_day2, digits = 0)) |>
+  #Repeat For PEEP (can use eligible_tv for this Measure)
+  mutate(temp=fcase(
+    eligible_tv==1, peep_set*(time_at_measure/time_tv_eligible48)
+  )) |>
+  mutate(peep_weighted_day2=fcase(
+    sum(is.na(temp))!=n(), sum(temp, na.rm=TRUE))) |>
+  mutate(peep_weighted_day2=round(peep_weighted_day2, digits = 0)) |>
+  #Repeat For Driving Pressure (can use eligible_lpv for this Measure)
+  #Filter Out Physiologically Implausible Values (Driving Pressure > 2 allowed)
+  mutate(temp_dp=fifelse(
+    eligible_lpv==1 & (pplat_lpv-peep_extrapolated>2), 1, 0
+  )) |>
+  #Filter Out the Time That the Implausible Measures Take
+  mutate(temp_time=fcase(
+    temp_dp==1, time_at_lpv_measure
+  )) |>
+  mutate(temp_time=fcase(
+    sum(is.na(temp_time))!=n(), sum(temp_time, na.rm = TRUE))) |>
+  mutate(temp=fcase(
+    temp_dp==1, (pplat_lpv-peep_extrapolated) *(time_at_lpv_measure/temp_time)
+  )) |>
+  ungroup()
+
+cat('\n Of ventilator observations on Day 2,\n ', dim(vent24_48_outcomes[vent24_48_outcomes$eligible_lpv == 1, ])[1], 'met criteria for LPV analysis,\n')
+cat(' ', dim(vent24_48_outcomes[vent24_48_outcomes$eligible_tv == 1, ])[1], 'met criteria for TV analysis on Day 2, and \n')
+cat(' ', dim(vent24_48_outcomes[(vent24_48_outcomes$eligible_tv == 1 & !is.na(vent24_48_outcomes$pplat_lpv)), ])[1], 'met criteria for Pplat analysis in this study. \n')
+
+cat('\n Summary Statistics for Number of Eligible Measures Per Participant')
+cat('\n Tidal Volume Measures Per Participant (Day2) \n')
+summary(vent24_48_outcomes$n_tv_eligible)
+cat('\n Number of Pplat Measures Per Participant (Day2) \n')
+summary(vent24_48_outcomes$n_pplat_eligible)
+cat('\n Number of LPV Measures Per Participant (Day2) \n')
+summary(vent24_48_outcomes$n_lpv_measures)
+
+cat('\n Patients Included in the Day2 LPV Analysis:\n')
+cat(length(unique(vent24_48_outcomes$cohort_id[vent24_48_outcomes$n_lpv_measures>=1])), 'patients \n')
+
+#Keep Track of Modes While TV Eligible
+cat('\n Ventilator Modes During TV Eligible Periods on Day 2:\n')
+PercTable(table(vent24_48_outcomes$mode_name[vent24_outcomes$eligible_tv==1]), rfrq = '001')
+
+cat('\n Ventilator Modes During Any Period On Day 2\n')
+PercTable(table(vent24_48_outcomes$mode_name), rfrq = '001')
+```
+
+```{r Day 2 Vent Summary}
+#First 'Long Form' Table
+#Select Wanted Variables and Format
+vent24_48_outcomes <- vent24_48_outcomes |>
+  select(cohort_id, recorded_time, mode_category:ecmo_type, eligible_mode:peep_weighted_day2, -temp) |>
+  relocate(encounter_block, study_vent_start:lpv_end_48hours, .after = cohort_id)
+
+#Create a Summary Table
+vent24_48_outcome_summary <- vent24_48_outcomes |>
+  #Get Vent Modes (For Description)
+  mutate(mode_miss=fifelse(is.na(mode_category),1, 0)) |>
+  group_by(cohort_id, mode_miss, eligible_tv) |>
+  mutate(first_vent_mode=fcase(
+    mode_miss==0 & row_number()==1 & eligible_tv==1, mode_name
+  )) |>
+  group_by(cohort_id) |>
+  fill(first_vent_mode, .direction = 'updown') |>
+  #Most Common Mode
+  group_by(cohort_id, mode_name, mode_miss, eligible_tv) |>
+  mutate(temp=fcase(
+    mode_miss==0 & eligible_tv==1, n())) |>
+  group_by(cohort_id) |>
+  mutate(most_mode_tv_eligible=fcase(
+    temp==max(temp, na.rm=TRUE), mode_name
+  )) |>
+  fill(most_mode_tv_eligible, .direction = c('downup')) |>
+  ungroup()
+
+#Select Wanted Variables and Select First Row
+vent24_48_outcome_summary <- vent24_48_outcome_summary |>
+  group_by(cohort_id, encounter_block) |>
+  filter(row_number()==1) |>
+  select(cohort_id, encounter_block, n_vent_observations, n_lpv_measures, n_tv_eligible, n_pplat_eligible, total_time_observed48, 
+         time_lpv_eligible48, time_tv_eligible48, hours_at_lpv_day2, percent_lpv_day2, hours_tv_gt8_day2, 
+         percent_tv_gt8_day2, tv_weighted_day2:peep_weighted_day2) |>
+  mutate(hours_at_lpv_day2=fifelse(is.na(time_lpv_eligible48), NaN, hours_at_lpv_day2)) |>
+  mutate(hours_tv_gt8_day2=fifelse(is.na(time_tv_eligible48), NaN, hours_tv_gt8_day2)) |>
+  mutate(tv_weighted_day2=fifelse(is.na(time_tv_eligible48), NaN, tv_weighted_day2)) |>
+  ungroup()
+
+#Round the Time and Percent Variables
+vars <- names(vent24_48_outcome_summary)[7:13]
+vent24_48_outcome_summary <- vent24_48_outcome_summary |>
+  mutate(across(
+    all_of(vars),
+    ~ round(., 2)
+  ))
+
+#Format for Merge
+vent24_48_outcome_summary <- vent24_48_outcome_summary |>
+  filter(total_time_observed48>0) |>
+  filter(n_tv_eligible>0 | n_lpv_measures>0) |>
+  rename(n_vent_observations_day2=n_vent_observations,
+         n_lpv_measures_day2=n_lpv_measures, 
+         n_tv_eligible_day2=n_tv_eligible,
+         n_pplat_eligible_day2=n_pplat_eligible)
+```
+
+
+```{r Vent Day 3 Outcomes}
+#Primary: % Eligible Time with TV <= 6.5 cc/kg-IBW and Pplat <=30 Between Hours 24 and 48
+#Need to Calculate Time At LPV and Denominator of Eligible Time
+#Additionally Calculate Components (time-weighted VT per kg IBW and time-weighted PPlat)
+
+#Track Numbers of Observations for Description in the Paper
+cat("\n In the analytic cohort there were,", dim(vent72_analytic)[1], "observed ventilator settings in the first 72 hours")
+
+vent48_72_outcomes <- vent72_analytic |> collect() |>
+  #Create an End Time for LPV Assessment at 72 Hours (the earliest of ventilator end or 72 hours after lpv time zero)
+  mutate(time_72hours=lpv_time_zero+dhours(72)) |>
+  mutate(day3_start=lpv_time_zero+dhours(48)) |>
+  mutate(lpv_end_72hours=fifelse(
+      time_72hours<=study_vent_end, time_72hours, study_vent_end)) |>
+  mutate(lpv_end_72hours=fifelse(
+    study_vent_end<day3_start, day3_start, lpv_end_72hours)) |>
+  select(-time_72hours) |>
+  filter(recorded_time>day3_start & recorded_time<=lpv_end_72hours)
+  
+vent48_72_outcomes <- vent48_72_outcomes |>
+  #How Many Ventilator Measurements on Day 3
+  group_by(cohort_id) |>
+  mutate(n_vent_observations=n()) |>
+  #For LPV Assessment Need to Use Paired Measurements of TV and PBW
+  mutate(eligible_lpv=fifelse(
+    eligible_tv==1 & (!is.na(pplat_lpv) & !is.na(tv_pbw)), 1, 0
+  )) |>
+  group_by(cohort_id, eligible_lpv) |>
+  mutate(n_lpv_measures=fifelse(
+    eligible_lpv==1, n(), NaN
+  )) |>
+  group_by(cohort_id, eligible_tv) |>
+  mutate(n_tv_eligible=fifelse(
+    !is.na(tv_lpv) & eligible_tv==1, n(), NaN
+  )) |>
+  mutate(n_pplat_eligible=fifelse(
+    !is.na(pplat_lpv) & eligible_tv==1, n(), NaN
+  )) |>
+  group_by(cohort_id) |>
+  fill(n_lpv_measures, n_tv_eligible, n_pplat_eligible, .direction = 'updown') |>
+  ungroup() |>
+  mutate(n_tv_eligible=fifelse(
+    is.na(n_tv_eligible), 0, n_tv_eligible
+  )) |>
+  mutate(n_pplat_eligible=fifelse(
+    is.na(n_pplat_eligible), 0, n_pplat_eligible
+  ))
+
+#For the Patients With no Eligible PPlat Can Use Ppeak 
+cat('\n Patients with no Eligible PPlat on Day 2:\n')
+cat(length(unique(vent48_72_outcomes$cohort_id[vent48_72_outcomes$n_pplat_eligible==0])), 'patients \n')
+cat('\n Patients with no Eligible LPV Measures in 1st 24 hours:\n')
+cat(length(unique(vent48_72_outcomes$cohort_id[is.na(vent48_72_outcomes$n_lpv_measures)])), 'patients \n')
+
+#Use Ppeak
+vent48_72_outcomes <- vent48_72_outcomes |>
+  #Keep Track of the Pplats in Which We Use PPeak Imputation
+  mutate(pplat_imp_ppeak=fcase(
+    eligible_tv==1 & is.na(n_lpv_measures), peak_inspiratory_pressure_obs
+  )) |>
+  #IF Pplat is Missing and It Was Otherwise an Eligible Measure Use the Ppeak Imputation
+  mutate(pplat_lpv=fifelse(
+    !is.na(pplat_imp_ppeak) & is.na(pplat_lpv), pplat_imp_ppeak, pplat_lpv
+  )) 
+
+#Redefine Eligible LPV and Recount the Numbers
+vent48_72_outcomes <- vent48_72_outcomes |>
+  mutate(eligible_lpv=fifelse(
+    eligible_tv==1 & (!is.na(pplat_lpv) & !is.na(tv_pbw)), 1, 0
+  )) |>
+  group_by(cohort_id, eligible_lpv) |>
+  mutate(n_lpv_measures=fifelse(
+    eligible_lpv==1, n(), NaN
+  )) |>
+  group_by(cohort_id) |>
+  fill(n_lpv_measures, .direction = 'updown') |>
+  ungroup() |>
+  mutate(n_lpv_measures=fifelse(
+    is.na(n_lpv_measures), 0, n_lpv_measures
+  ))
+
+#After Imputation Counts
+cat('\n In Patients with no Eligible PPlat on Day 3, We Used PPeak and After That Imputation There were:\n')
+cat(length(unique(vent48_72_outcomes$cohort_id[vent48_72_outcomes$n_lpv_measures>=1])), 'patients with LPV measures for Analysis \n')
+cat('\n Patients with no Eligible LPV Measures on Day 2:\n',length(unique(vent48_72_outcomes$cohort_id[vent48_72_outcomes$n_lpv_measures==0])))
+
+#Comparison of 'Imputed PPlat' and 'Recorded Pplat'
+cat('\n Recorded PPlat During Eligible Measurements \n')
+summary(vent48_72_outcomes$pplat_lpv[(is.na(vent48_72_outcomes$pplat_imp_ppeak) & vent48_72_outcomes$eligible_lpv==1)])
+cat('\n Ppeak Substitutin During PPlat During Eligible Measurements \n')
+summary(vent48_72_outcomes$pplat_imp_ppeak)
+```
+```{r Vent Day 3 OUtcomes}
+#Calculate Time Spent With Each Measurement
+vent48_72_outcomes <- vent48_72_outcomes |>
+  #Calculate Total Time Observed on Day 3 Per Patient
+  group_by(cohort_id) |>
+  mutate(time_at_measure=fcase(
+    row_number()!=n(), as.duration(lead(recorded_time)-recorded_time)/dhours(1), #Time to Next Observation
+    row_number()==n(), as.duration(lpv_end_72hours-recorded_time)/dhours(1), #If last observation Time to End of 72 Hour Period
+    recorded_time==study_vent_end, 0 #If the Last Observation is the Time of Vent End Will Call it 0 Hours *Which means exclude
+  )) |>
+  mutate(total_time_observed72=sum(time_at_measure)) |>
+  #Carry Forward PEEP
+  mutate(peep_extrapolated=peep_set) |>
+  fill(peep_extrapolated, .direction= 'downup') |>
+  #Now Total LPV Eligible Time
+  mutate(eligible_lpv_time=fcase(
+    eligible_lpv==1 | eligible_tv==0, 1, #To calculate time from paired TV/PPlat measurements to next. IF measure not eligible for TV measurement (not on controlled mode) time stops until next measurement is eligible
+    eligible_lpv==0 & eligible_tv==1, 2
+  )) |>
+  group_by(cohort_id, eligible_lpv_time) |>
+  mutate(time_at_lpv_measure=fcase(
+    row_number()!=n(), as.duration(lead(recorded_time)-recorded_time)/dhours(1), #Time to Next Observation
+    row_number()==n(), as.duration(lpv_end_72hours-recorded_time)/dhours(1) #If last observation Time to End of 72 Hour Period
+  )) |>
+  #Now Sum For Each Patient
+  group_by(cohort_id, eligible_lpv) |>
+  mutate(time_lpv_eligible72=fcase(
+    eligible_lpv_time==1 & eligible_tv==1, sum(time_at_lpv_measure),
+    default = NaN
+  )) |>
+  #Now Can Sum Time at TV
+  group_by(cohort_id, eligible_tv) |>
+  mutate(time_tv_eligible72=fcase(
+    eligible_tv==1, sum(time_at_measure)
+  )) |>
+  #Total TV Eligible Time (NOTE: For Pplat Can Use Total LPV Time)
+  group_by(cohort_id) |>
+  mutate(time_tv_eligible72=fifelse(time_tv_eligible72==0, NaN, time_tv_eligible72)) |> #For Those with No Tidal Volume Time to Contribute
+  mutate(time_lpv_eligible72=fifelse(time_lpv_eligible72==0, NaN, time_lpv_eligible72)) |>
+  fill(time_tv_eligible72, time_lpv_eligible72, .direction='updown') |>
+  ungroup()
+
+cat('\n Time (hours) per Patient Available for LPV Analysis on Day 3[This will be the Same for Driving Pressure and PEEP \n')
+summary(vent48_72_outcomes$time_lpv_eligible72[vent48_72_outcomes$n_lpv_measures>0])
+hist(vent48_72_outcomes$time_lpv_eligible72[vent48_72_outcomes$n_lpv_measures>0])
+
+cat('\n Time (hours) per Patient Available for TV Analysis on Day 3 \n')
+summary(vent48_72_outcomes$time_tv_eligible72[vent48_72_outcomes$n_tv_eligible>0])
+hist(vent48_72_outcomes$time_tv_eligible72[vent48_72_outcomes$n_tv_eligible>0])
+
+#Pimary Outcome: Percentage of Time At LPV
+vent48_72_outcomes <- vent48_72_outcomes |>
+  mutate(met_lpv=fcase(
+    eligible_lpv==1 & tv_pbw<=6.5 & pplat_lpv<=30, 1,
+    eligible_lpv==1 & (tv_pbw>6.5 | pplat_lpv>30), 0
+  )) |>
+  #If patient Didn't Meet LPV THis Won't Be Included in Numerator so Numerator is Time LPV Met and Denominator is Total Eligible Time
+  group_by(cohort_id) |>
+  mutate(hours_at_lpv_day3=sum((met_lpv*time_at_lpv_measure), na.rm=TRUE)) |>
+  mutate(percent_lpv_day3=
+           hours_at_lpv_day3/time_lpv_eligible72) |>
+  #Repeat With Restricted Definition
+  mutate(met_lpv_restrict=fcase(
+    eligible_lpv==1 & tv_pbw<=6.5 & pplat_lpv<=30, 1,
+    eligible_lpv==1 & tv_pbw<6.0 & pplat_lpv>30, 1,
+    eligible_lpv==1 & (tv_pbw>6.5 | (tv_pbw>=6.0 & pplat_lpv>30)), 0
+  )) |>
+  ungroup()
+
+#Secondary Outcome Hours (%) of Time Spent with TV >8.0 in 1st 24 Hours, TV > 7 on Day 2, TV > 6.5 on Day 2
+#Now Create Time-weighted TV, PEEP and Driving Pressure Measures
+vent48_72_outcomes <- vent48_72_outcomes |>
+  mutate(tv_gt8_day3=fcase(
+    eligible_tv==1 & tv_pbw>8, 1,
+    eligible_tv==1 & tv_pbw<=8, 0
+  )) |>
+  group_by(cohort_id) |>
+  mutate(hours_tv_gt8_day3=sum((tv_gt8_day3*time_at_measure), na.rm=TRUE)) |>
+  mutate(percent_tv_gt8_day3=
+           hours_tv_gt8_day3/time_tv_eligible72) |>
+  ungroup()
+    
+#Now Time Weighted TV, Pplat, PEEP and Driving Pressure; Baseline Respiratory Compliance
+vent48_72_outcomes <- vent48_72_outcomes |>
+  #Start with Tidal Volume
+  group_by(cohort_id) |>
+  #Calculate Weighted Tidal Volume = TV* (time observed/time eligible)
+  mutate(temp=fcase(
+    eligible_tv==1, tv_pbw*(time_at_measure/time_tv_eligible72)
+  )) |>
+  #Sum the Non Missing
+  mutate(tv_weighted_day3=sum(temp, na.rm=TRUE)) |>
+  mutate(tv_weighted_day3=round(tv_weighted_day3, digits = 1)) |>
+  #Repeat For Pplat (can use eligible_lpv for this Measure)
+  mutate(temp=fcase(
+    eligible_lpv==1, pplat_lpv*(time_at_lpv_measure/time_lpv_eligible72)
+  )) |>
+  #As Along As All Values ARe Not Missing Can Do Sum
+  mutate(pplat_weighted_day3=fcase(
+    sum(is.na(temp))!=n(), sum(temp, na.rm=TRUE))) |>
+  mutate(pplat_weighted_day3=round(pplat_weighted_day3, digits = 0)) |>
+  #Repeat For PEEP (can use eligible_tv for this Measure)
+  mutate(temp=fcase(
+    eligible_tv==1, peep_set*(time_at_measure/time_tv_eligible72)
+  )) |>
+  mutate(peep_weighted_day3=fcase(
+    sum(is.na(temp))!=n(), sum(temp, na.rm=TRUE))) |>
+  mutate(peep_weighted_day3=round(peep_weighted_day3, digits = 0)) |>
+  #Repeat For Driving Pressure (can use eligible_lpv for this Measure)
+  #Filter Out Physiologically Implausible Values (Driving Pressure > 2 allowed)
+  mutate(temp_dp=fifelse(
+    eligible_lpv==1 & (pplat_lpv-peep_extrapolated>2), 1, 0
+  )) |>
+  #Filter Out the Time That the Implausible Measures Take
+  mutate(temp_time=fcase(
+    temp_dp==1, time_at_lpv_measure
+  )) |>
+  mutate(temp_time=fcase(
+    sum(is.na(temp_time))!=n(), sum(temp_time, na.rm = TRUE))) |>
+  mutate(temp=fcase(
+    temp_dp==1, (pplat_lpv-peep_extrapolated) *(time_at_lpv_measure/temp_time)
+  )) |>
+  ungroup()
+
+cat('\n Of ventilator observations on Day 2,\n ', dim(vent48_72_outcomes[vent48_72_outcomes$eligible_lpv == 1, ])[1], 'met criteria for LPV analysis,\n')
+cat(' ', dim(vent48_72_outcomes[vent48_72_outcomes$eligible_tv == 1, ])[1], 'met criteria for TV analysis on Day 2, and \n')
+cat(' ', dim(vent48_72_outcomes[(vent48_72_outcomes$eligible_tv == 1 & !is.na(vent48_72_outcomes$pplat_lpv)), ])[1], 'met criteria for Pplat analysis in this study. \n')
+
+cat('\n Summary Statistics for Number of Eligible Measures Per Participant')
+cat('\n Tidal Volume Measures Per Participant (day3) \n')
+summary(vent48_72_outcomes$n_tv_eligible)
+cat('\n Number of Pplat Measures Per Participant (day3) \n')
+summary(vent48_72_outcomes$n_pplat_eligible)
+cat('\n Number of LPV Measures Per Participant (day3) \n')
+summary(vent48_72_outcomes$n_lpv_measures)
+
+cat('\n Patients Included in the day3 LPV Analysis:\n')
+cat(length(unique(vent48_72_outcomes$cohort_id[vent48_72_outcomes$n_lpv_measures>=1])), 'patients \n')
+
+#Keep Track of Modes While TV Eligible
+cat('\n Ventilator Modes During TV Eligible Periods on Day 2:\n')
+PercTable(table(vent48_72_outcomes$mode_name[vent24_outcomes$eligible_tv==1]), rfrq = '001')
+
+cat('\n Ventilator Modes During Any Period On Day 2\n')
+PercTable(table(vent48_72_outcomes$mode_name), rfrq = '001')
+```
+
+
+```{r Day 3 Vent Summary}
+#First 'Long Form' Table
+#Select Wanted Variables and Format
+vent48_72_outcomes <- vent48_72_outcomes |>
+  select(cohort_id, recorded_time, mode_category:ecmo_type, eligible_mode:peep_weighted_day3, -temp) |>
+  relocate(encounter_block, study_vent_start:lpv_end_72hours, .after = cohort_id)
+
+#Create a Summary Table
+vent48_72_outcome_summary <- vent48_72_outcomes |>
+  #Get Vent Modes (For Description)
+  mutate(mode_miss=fifelse(is.na(mode_category),1, 0)) |>
+  group_by(cohort_id, mode_miss, eligible_tv) |>
+  mutate(first_vent_mode=fcase(
+    mode_miss==0 & row_number()==1 & eligible_tv==1, mode_name
+  )) |>
+  group_by(cohort_id) |>
+  fill(first_vent_mode, .direction = 'updown') |>
+  #Most Common Mode
+  group_by(cohort_id, mode_name, mode_miss, eligible_tv) |>
+  mutate(temp=fcase(
+    mode_miss==0 & eligible_tv==1, n())) |>
+  group_by(cohort_id) |>
+  mutate(most_mode_tv_eligible=fcase(
+    temp==max(temp, na.rm=TRUE), mode_name
+  )) |>
+  fill(most_mode_tv_eligible, .direction = c('downup')) |>
+  ungroup()
+
+#Select Wanted Variables and Select First Row
+vent48_72_outcome_summary <- vent48_72_outcome_summary |>
+  group_by(cohort_id, encounter_block) |>
+  filter(row_number()==1) |>
+  select(cohort_id, encounter_block, n_vent_observations, n_lpv_measures, n_tv_eligible, n_pplat_eligible, total_time_observed72, 
+         time_lpv_eligible72, time_tv_eligible72, hours_at_lpv_day3, percent_lpv_day3, hours_tv_gt8_day3, 
+         percent_tv_gt8_day3, tv_weighted_day3:peep_weighted_day3) |>
+  mutate(hours_at_lpv_day3=fifelse(is.na(time_lpv_eligible72), NaN, hours_at_lpv_day3)) |>
+  mutate(hours_tv_gt8_day3=fifelse(is.na(time_tv_eligible72), NaN, hours_tv_gt8_day3)) |>
+  mutate(tv_weighted_day3=fifelse(is.na(time_tv_eligible72), NaN, tv_weighted_day3)) |>
+  ungroup()
+
+#Round the Time and Percent Variables
+vars <- names(vent48_72_outcome_summary)[7:13]
+vent48_72_outcome_summary <- vent48_72_outcome_summary |>
+  mutate(across(
+    all_of(vars),
+    ~ round(., 2)
+  ))
+
+#Format for Merge
+vent48_72_outcome_summary <- vent48_72_outcome_summary |>
+  filter(total_time_observed72>0) |>
+  filter(n_tv_eligible>0 | n_lpv_measures>0) |>
+  rename(n_vent_observations_day3=n_vent_observations,
+         n_lpv_measures_day3=n_lpv_measures, 
+         n_tv_eligible_day3=n_tv_eligible,
+         n_pplat_eligible_day3=n_pplat_eligible)
+```
+
+
+```{r Add Day 2 and 3 Summaries to LPV Analytic}
+lpv_analytic <- lpv_analytic |>
+  left_join(vent24_48_outcome_summary) |>
+  left_join(vent48_72_outcome_summary)
+
+```
+
+
+```{r Save Analytic Files}
+write_parquet(lpv_analytic, paste0(project_path, '/data/lpv_analytic.parquet'))
+write_parquet(vent24_outcome_summary, paste0(project_path, '/data/vent24_outcome_summary.parquet'))
+write_parquet(vent24_outcomes, paste0(project_path, '/data/vent24_outcomes_long.parquet'))
+```
+

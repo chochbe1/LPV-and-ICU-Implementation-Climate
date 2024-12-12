@@ -1,0 +1,1529 @@
+---
+title: "K23_Aim1_LPV_Cohort_ETL"
+author: "Chad H. Hochberg"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+library(here) #Makes working with directories easier
+library(tidyverse) #dplyr syntax for data wrangling
+library(data.table) #Some commands here are faster than dplyr when working with big data
+library(arrow) #This library allows working with apache arrow which is a memory efficient way to work with these data
+library(collapse) #Fast Data Manipulation Package
+library(comorbidity) #Calculate Elixhauser Index (Note this implements the Quan MedCare implementation of Elixhauser)
+
+#Set Working Directory
+knitr::opts_knit$set(root.dir = "~/workspace/Storage/chochbe1/persistent/K23_Aim1_LPV_Analysis")
+
+#Create Commonly Used Function
+`%!in%` = Negate(`%in%`)
+
+#Path to JH-CCRD Tables
+data_path <- '~/workspace/Storage/chochbe1/JH_CCRD/data/'
+#Project Path
+project_path <- '~/workspace/Storage/chochbe1/persistent/K23_Aim1_LPV_Analysis'
+
+#Here
+here::i_am('K23_aim1_lpv_here.R')
+```
+
+#Implenting Inclusion/Exclusion Criteria - Order
+Inclusions (here oddly stated as exclusions to make clear who is filtered out)
+1. Filter to Dates
+2. Filter out Those that Did Not Receive Mechanical Ventilation
+3. Filter Out Those Whose 1st Mechanical Ventilation Episode was < 12 Hours
+4. Filter Out Those Who Dont Meet PF <=300 or S/F <= 315 (and SpO2 <=97%) in the 24 hours prior to mechanical ventilation OR, if those data are missing, within 12 hours of mechanical ventilation
+
+Exclusions:
+1. Died or Transferred out within 24 Hours of Admission
+2. Mechanical Ventilation Initiated Outside the JHHS
+3. Tracheostomy Present on Admission and Mechanical Ventilation Provided in 1st 24 Hours AND No Procedure Code for Tracheostomy/Cricothyroidotomy on Day 1
+
+```{r Filter to ICU/IMC Encounters within Study Date Range}
+encounters <- open_dataset(paste0(data_path, 'encounters')) |>
+#Filter to Dates of Study (Admitted between July 2022 and June 2024 (inclusive))
+ filter(final_admit_date >= ymd('2022-07-01') & final_admit_date < ymd('2024-07-01')) |>
+ #Calculate Age (NOTE: For those Admitted as John Doe the Birth Year is 1871)
+ mutate(age_at_admission = round(arrow_years_between(birth_date, final_admit_date), digits=1)) |>
+ mutate(age_at_admission = if_else(year(birth_date)==1871, NaN, age_at_admission)) |>
+ relocate(encounter_block, .after=pat_enc_csn_id) |>
+ ungroup() |>
+ compute()
+
+#Clean race/ethnicity variables and keep needed information
+encounters <- encounters |>
+  mutate(race=fcase(
+    first_race %in% c('Black'), 'Black or African-American',
+    first_race == 'White', "White",
+    first_race == 'Am Indian', 'American Indian or Alaska Native',
+    first_race %in% c('Asian', 'Asian Indian', 'Chinese', 'Filipino', 'Japanese', 'Korean', 'Other Asian', 'Vietnamese'),
+      'Asian',
+    first_race %in% c('Guamanian', 'Native Hawai', 'Other Pacifi', 'Pac Islander', 'Samoan'), 
+      'Native Hawaiian or Other Pacific Islander',
+    first_race %in% c('NotDisclose', 'Unable to Ob', 'Unknown', 'Hispanic'), 'Unknown',
+    first_race == 'Other', 'Other'
+  )) |>
+  mutate(ethnicity=fifelse(
+    ethnic_group=='Not Hispanic', 'Not Hispanic', 'Hispanic'
+  )) |>
+  select(cohort_id, pat_enc_csn_id:link_icu_encounter, admit_source, admit_source_c, labor_status:hosp_admsn_type, disch_disp_c, disc_disp, ed_visit_yn, transfer_from_c, transfer_from, disch_destination, birth_date:death_date, gender, age_at_admission, race, ethnicity) |>
+  compute()
+
+#Consort Diagram Box #1
+cat('\n For Consort: # of JHHS ICU Encounters in Study Time Frame', length(unique(encounters$pat_enc_csn_id)), '\n')
+cat('For Consort: # of JHHS ICU Patients in Study Time Frame', length(unique(encounters$cohort_id)), '\n')
+```
+
+```{r MV For At Least 12 hours}
+#Start with O2 Episodes and Identify Those Who Receive Mechanical Ventilation
+mv_episodes <- open_dataset(paste0(data_path, 'o2_episodes')) |>
+  filter(pat_enc_csn_id %in% encounters$pat_enc_csn_id) |>
+  filter(vent_transition=='On Vent') |> #Filter To Only Episodes of Mechanical Ventilation
+  collect()
+#Track for Consort
+enc_length <- length(unique(encounters$pat_enc_csn_id))
+pat_length <- length(unique(encounters$cohort_id))
+cat('\n For Consort:', enc_length-length(unique(mv_episodes$pat_enc_csn_id)), 'encounters excluded for no mechanical ventilation')
+cat('\n      yielding:', length(unique(mv_episodes$pat_enc_csn_id)), 'encounters with mechanical ventilation') 
+cat('\n For Consort:', pat_length-length(unique(mv_episodes$cohort_id)), 'patients excluded for no mechanical ventilation')
+cat('\n      yielding:', length(unique(mv_episodes$cohort_id)), 'patients with mechanical ventilation') 
+
+#Now Identify Those With 1st Mechanical Ventilation Episode >= 12 Hours
+#First Will Need to Merge in Final Admit and Discharge Dates
+merge_dc <- encounters |>
+  select(cohort_id, pat_enc_csn_id, final_admit_date, final_dc_date, encounter_block) |>
+  collect()
+mv_episodes <- mv_episodes |>
+  join(merge_dc, how = 'left')
+rm(merge_dc)
+#Now Select First Ventilator Episode per Encounter ID
+mv_episodes <- mv_episodes |>
+  group_by(cohort_id, pat_enc_csn_id) |>
+  arrange(cohort_id, vent_start) |>
+  filter(row_number()==1) |>
+  ungroup() 
+
+#Define 1st Vent Duration - NOTE: vent_end is missing for some patients with linked encounters (can use link_vent_end) and discharged on vent (can use discharge time)
+mv_episodes <- mv_episodes |>
+  mutate(temp_start=fcase(
+    !is.na(link_vent_start), link_vent_start,
+    is.na(link_vent_start), vent_start
+  )) |>
+  mutate(temp_end=fcase(
+    !is.na(link_vent_end), link_vent_end,
+    is.na(link_vent_end), vent_end
+  )) |>
+  mutate(temp_end=fifelse(
+    is.na(temp_end), final_dc_date, temp_end
+  )) |>
+  mutate(first_vent_duration_hrs=as.duration(temp_end-temp_start)/dhours(1)) |>
+  mutate(study_vent_start=temp_start) |>
+  mutate(study_vent_end=temp_end) |>
+  select(-temp_end, -temp_start)
+
+#Exclude those wiht < 12 hours of MV and Keep Track for Flow Chart
+enc_length <- length(unique(mv_episodes$pat_enc_csn_id))
+pat_length <- length(unique(mv_episodes$cohort_id))
+mv_episodes <- mv_episodes |>
+  filter(first_vent_duration_hrs>=12)
+cat('\n For Consort:', enc_length-length(unique(mv_episodes$pat_enc_csn_id)), 'encounters excluded for MV < 12 Hours')
+cat('\n      yielding:', length(unique(mv_episodes$pat_enc_csn_id)), 'encounters with more than 12 hours of MV') 
+cat('\n For Consort:', pat_length-length(unique(mv_episodes$cohort_id)), 'patients excluded for MV < 12')
+cat('\n      yielding:', length(unique(mv_episodes$cohort_id)), 'patients with more than 12 hours of MV \n') 
+```
+
+```{r Identify Patients with Hypoxemic Respiratory Failure}
+#Criteria are PF <= 300 or SpO2/FiO2 <= 315 (if SpO2 <=97%)
+#This Criteria Needs to Occur at Any Time in the 24 hours Prior to Intubation OR if missing from that period from first 12 hours of MV
+#Additionally Will Collect Lowest PF or SF in 1st 24 Hours of MV
+#This will allow for easier sensitivity analyses based on lowest PF/SF in first 24 hours of MV
+#For Low Flow Oxygen (1-6 L/NC) will add 0.03 FiO2 for each L above room air
+
+#Create Vent Start for Merging
+vent_start <- mv_episodes |>
+  select(cohort_id, encounter_block, study_vent_start)
+encounter_block <- encounters |>
+  select(cohort_id, pat_enc_csn_id, encounter_block)
+
+#Create a Table of Eligible ABGs (PF <=300 in first 24 hours prior to intubation or 12 hours after)
+#1st Pull in ABG Table and Do Some Quality Control (NOTE: Already filtered to PaO2 values >=40)
+abgs <- open_dataset(paste0(data_path, 'abg_table')) |>
+  #Merge in Encounter Blocks
+  left_join(encounter_block) |>
+  left_join(vent_start) |> #One Vent Start per Linked Encounter
+  filter(!is.na(study_vent_start)) |> #Now Just to Patients Who > 12 Hours of MV
+  #Define FiO2s for Non Vent/NIPPV/HIFNC settings
+  mutate(temp_fio2=case_when(
+    o2_status_c_last=='room air' ~ 21,
+    o2_status_c_last=='low O2' & o2flow_carried<=8 ~ (o2flow_carried*3) + 21,
+    o2_status_c_last=='high O2' & o2flow_carried<=15 ~ (o2flow_carried*3) + 21 #Imperfect accounting for mismash of aerosol, non-rebreather and venturi masks
+  )) |>
+  mutate(fio2_carried=if_else(
+    is.na(fio2_carried), temp_fio2, fio2_carried
+  )) |>
+  mutate(pf_ratio=if_else(
+    is.na(pf_ratio), pao2/(fio2_carried/100), pf_ratio
+  )) |>
+  collect() |>
+  filter(recorded_time<=study_vent_start+dhours(12) & recorded_time>=study_vent_start-dhours(24)) |>
+  mutate(pre_vent=fifelse(recorded_time<study_vent_start, 1, 0)) |>
+  group_by(cohort_id, encounter_block, pre_vent) |>
+  mutate(temp_low_pf=fifelse(pf_ratio==min(pf_ratio, na.rm = TRUE), 1, 0)) |>
+  filter(temp_low_pf==1) |>
+  filter(row_number()==1) |>
+  mutate(pre_vent_pf=fcase(
+    pre_vent==1, pf_ratio
+  )) |>
+  mutate(post_vent_pf=fcase(
+    pre_vent==0, pf_ratio
+  )) |>
+  ungroup() |> group_by(cohort_id, encounter_block) |>
+  fill(pre_vent_pf, .direction = c('downup')) |>
+  fill(post_vent_pf, .direction = c('downup')) |>
+  mutate(keep=fcase(
+    max(pre_vent)==1 & pre_vent==1, 1,
+    max(pre_vent)==0 & pre_vent==0, 1
+  )) |>
+  filter(keep==1) |>
+  select(cohort_id:o2_status_c_last, ph:pao2, sao2, pre_vent_pf, post_vent_pf, o2flow_carried, encounter_block, -recorded_time) |>
+  rename(pf_o2_status=o2_status_carried, 
+         pf_fio2=fio2_carried, 
+         pf_o2_device=meas_value_carried,
+         pf_o2_status_c=o2_status_c_last,
+         pf_o2_flow=o2flow_carried
+         ) |>
+  #Finally filter to only those meeting oxygenation criteria (favor pre-vent measurements)
+  filter(pre_vent_pf<=300 | (is.na(pre_vent_pf) & post_vent_pf<=300)) |>
+  ungroup()
+
+
+#Repeat Similiar Process with Master O2 Table to Get S/F Ratio (<=315 in 24 hours prior to intubaiton or 12 hours after)
+#SpO2 has to be <= 97%
+sf_ratios <- open_dataset(paste0(data_path, 'master_o2_build')) |>
+  left_join(encounter_block) |>
+  left_join(vent_start) |> #One Vent Start per Linked Encounter
+  filter(!is.na(study_vent_start)) |> #Now Just to Patients Who > 12 Hours of MV
+  #Filter Out Spo2 <70 or > 100
+  filter(spo2>=70 & spo2<=100) |>
+  #Define FiO2s for Non Vent/NIPPV/HIFNC settings
+  mutate(temp_fio2=case_when(
+    o2_status_c_last=='room air' ~ 21,
+    o2_status_c_last=='low O2' & o2flow<=8 ~ (o2flow*3) + 21,
+    o2_status_c_last=='high O2' & o2flow<=15 ~ (o2flow*3) + 21 #Imperfect accounting for mismash of aerosol, non-rebreather and venturi masks
+  )) |>
+  mutate(fio2_carried=if_else(
+    is.na(fio2_carried), temp_fio2, fio2_carried
+  )) |>
+  mutate(sf_ratio=if_else(
+    is.na(sf_ratio), spo2/(fio2_carried/100), sf_ratio
+  )) |>
+  mutate(sf_ratio=if_else(
+    spo2>97, NaN, sf_ratio
+  )) |>
+  left_join(vent_start) |>
+  collect() |>
+  filter(recorded_time<=study_vent_start+dhours(12) & recorded_time>=study_vent_start-dhours(24)) |>
+  mutate(pre_vent=fifelse(recorded_time<study_vent_start, 1, 0)) |>
+  group_by(cohort_id, encounter_block, pre_vent) |>
+  mutate(temp_low_sf=fifelse(sf_ratio==min(sf_ratio, na.rm = TRUE), 1, 0)) |>
+  filter(temp_low_sf==1) |>
+  filter(row_number()==1) |>
+  mutate(pre_vent_sf=fcase(
+    pre_vent==1, sf_ratio
+  )) |>
+  mutate(post_vent_sf=fcase(
+    pre_vent==0, sf_ratio
+  )) |>
+  ungroup() |> group_by(cohort_id, encounter_block) |>
+  fill(pre_vent_sf, .direction = c('downup')) |>
+  fill(post_vent_sf, .direction = c('downup')) |>
+  mutate(keep=fcase(
+    max(pre_vent)==1 & pre_vent==1, 1,
+    max(pre_vent)==0 & pre_vent==0, 1
+  )) |>
+  filter(keep==1) |>
+  select(cohort_id:pat_enc_csn_id, o2flow:o2_status_c_last, pre_vent_sf, post_vent_sf, encounter_block) |>
+  rename(sf_o2_status=o2_status_carried, 
+         sf_fio2=fio2_carried, 
+         sf_o2_device=meas_value_carried,
+         sf_o2_status_c=o2_status_c_last,
+         sf_o2_flow=o2flow
+         ) |>
+  #Finally filter to only those meeting oxygenation criteria (favor pre-vent measurements)
+  filter(pre_vent_sf<=315 | (is.na(pre_vent_sf) & post_vent_sf<=315)) |>
+  ungroup()
+
+#Now Merge into a AHRF Criteria Table
+#This Table is 1 Row per Encounter Block That a Patient Met AHRF Criteria During 1st Episode of MV
+ahrf_criteria <- sf_ratios |>
+  full_join(abgs, by = c('cohort_id', 'pat_enc_csn_id')) |>
+  rename(encounter_block=encounter_block.x) |>
+  select(-encounter_block.y) |>
+  relocate(encounter_block, .after = pat_enc_csn_id) |>
+  arrange(cohort_id, encounter_block)
+
+#Merge Back to MV Episodes Table
+#Create File to Merge into MV Episodes
+temp_merge <- ahrf_criteria |> select(-pat_enc_csn_id) |> #Only want to Merge 1 Row per Encounter Block
+  mutate(ahrf=1) #Mark for Filtering to Those Who Meet AHRF Criteria as Set Out Above
+
+#Track for Consort Diagram
+enc_length <- length(unique(mv_episodes$pat_enc_csn_id))
+pat_length <- length(unique(mv_episodes$cohort_id))
+
+#Now Merge and Calculate New N
+mv_ahrf <- mv_episodes |>
+  join(temp_merge, how = 'left') |>
+  relocate(encounter_block, .after = pat_enc_csn_id) |>
+  filter(ahrf==1) |>
+  select(cohort_id:encounter_block, end_modality:link_vent_end, link_group:pf_o2_flow)
+rm(temp_merge)
+
+#Consort Calculations
+cat('\n For Consort:', enc_length-length(unique(mv_ahrf$pat_enc_csn_id)), 'encounters did not meet AHRF criteria')
+cat('\n      yielding:', length(unique(mv_ahrf$pat_enc_csn_id)), 'encounters meeting MV and AHRF criteria') 
+cat('\n For Consort:', pat_length-length(unique(mv_ahrf$cohort_id)), 'patients did not meet AHRF criteria')
+cat('\n      yielding:', length(unique(mv_ahrf$cohort_id)), 'patients meeting MV and AHRF criteria \n') 
+
+rm(abgs, ahrf_criteria, sf_ratios, vent_start)
+```
+
+```{r Define Study ICUs and Timing of MV Relative to Study ICU Admission}
+#This section also helps refine the JH-CCRD definition of an ICU
+#Vector with Units that Are Likely to Have VEntilated Patients at Some Point
+all_icus <- c("HCGH 3C ICU",
+          "BMC CARDIAC ICU",
+          "JHH ZAYED 9E", #JH SICU
+          "JHH ZAYED 10E", #JH MICU
+          "BMC MEDICAL ICU",
+          "BMC SURGICAL ICU",
+          "JHH ZAYED 5E", #CVSICU
+          "SH 3100 INTENSIVE CARE",
+          "SH 3400 INTENSIVE CARE",
+          "JHH ZAYED 5W",
+          "JHH ZAYED 3W", #JH NCCU
+          "SMH INTENSIVE CARE",
+          "JHH BLOOMBERG 4S", #JH PCICU
+          "BMC BURN ICU", 
+          "BMC OVERFLOW PACU ICU",
+          "SMH OVERFLOW PACU ICU",
+          "SH INTENSIVE CARE 3300",
+          "JHH BLOOMBERG 4N", #PICU
+          "JHH WBG OVFLW PACU ICU",
+          "BMC NICU",
+          "HCGH OVERFLOW PACU ICU",
+          "ACH 5S PICU",
+          "JHH WEINBERG 3A",
+          "ZDEAC SMH ICU",
+          "SMH 2B ICU",
+          #HCGH 3S SCU", #This unit Appears to Have Med/Surg, IMCU, and ICU level of Care
+          #"JHH NELSON 5", #ICU during COVID Pandemic
+          "BMC NEUROSCIENCE CCU",#Neurounit that has ICU level of care, IMC level of care (in database, will investigate in EPIC)
+          #"JHH BLOOMBERG 5S", #HOpkins Cardiology Unit, has some IMC Beds)
+          #"BMC WENZ ORTHO CENTER",#Was IMC during COVID Pandemic
+          #"BMC WENZ OVERFLOW", #IMC During COVID Pandemic
+          "JHH WEINBERG 5C", #Oncology ICU, but can also take floor and IMC level patients
+          "ZDEAC SH ICU 2400",
+          "SMH 7B",
+          #"BMC PRGRSIVE CARE UNIT", #PCU at Bayview
+          #"SH 2400 IMCU",
+          #"HCGH 3S SCU", #This unit Appears to Have Med/Surg, IMCU, and ICU level of Care
+          "JHH WEINBERG 5C" #Oncology ICU, but can also take floor and IMC level patients
+      )
+
+#ICUs that were Included in the Survey
+target_icus <- c("HCGH 3C ICU",
+          "BMC CARDIAC ICU",
+          "JHH ZAYED 9E", #JH SICU
+          "JHH ZAYED 10E", #JH MICU
+          "BMC MEDICAL ICU",
+          "BMC SURGICAL ICU",
+          "JHH ZAYED 5E", #CVSICU
+          "SH 3100 INTENSIVE CARE",
+          "SH 3400 INTENSIVE CARE",
+          "JHH ZAYED 5W",
+          "JHH ZAYED 3W", #JH NCCU
+          "SMH INTENSIVE CARE",
+          "JHH BLOOMBERG 4S", #JH PCICU
+          #BMC BURN ICU removed for this analysis
+          #BMC OVERFLOW PACU ICU",
+          #SMH OVERFLOW PACU ICU",
+          "SH INTENSIVE CARE 3300",
+          #JHH BLOOMBERG 4N", #PICU
+          #JHH WBG OVFLW PACU ICU",
+          #BMC NICU",
+          #"HCGH OVERFLOW PACU ICU",
+          #ACH 5S PICU",
+          "JHH WEINBERG 3A",
+          "ZDEAC SMH ICU",
+          "SMH 2B ICU",
+          #"HCGH 3S SCU", #This unit Appears to Have Med/Surg, IMCU, and ICU level of Care
+          #"JHH NELSON 5", #ICU during COVID Pandemic
+          #"BMC NEUROSCIENCE CCU",#Neurounit that has ICU level of care, IMC level of care (in database, will investigate in EPIC)
+          #"JHH BLOOMBERG 5S", #HOpkins Cardiology Unit, has some IMC Beds)
+          #"BMC WENZ ORTHO CENTER",#Was IMC during COVID Pandemic
+          #"BMC WENZ OVERFLOW",
+          "JHH WEINBERG 5C", #Oncology ICU, but can also take floor and IMC level patients
+          "ZDEAC SH ICU 2400",
+          "SMH 7B")
+
+#NOTE: ICU Definitions are not precise, so need to rely on target study units and mechanical ventilation to define an ICU admission (for example for Weinberg 5C)
+adt_total <- open_dataset(paste0(data_path, 'derived_adt_location_history')) |>
+  filter(adt_department_name %in% all_icus) |>
+  filter(pat_enc_csn_id %in% mv_ahrf$pat_enc_csn_id) |>
+  mutate(target_icu=if_else(adt_department_name %in% target_icus, 1, 0)) |>
+  compute()
+
+#Create adt dataset that consists of all ICUs, and notes which are target ICUs, rest of data built from there
+#First Extract Needed Data from mv_ahrf patients
+df <- mv_ahrf |> select(cohort_id, pat_enc_csn_id, encounter_block, final_admit_date, link_group:study_vent_end) 
+
+adts <- adt_total |>
+  full_join(df) |> compute()
+#Evaluate Missing ADTs
+#NOTE: Joining appears appropriate. Only 1 encounter that is not part of a linked encounter is missing ADT info, meaning that all encounters except this one have an associated admission to one of the 'all_icus' listed above! The 1 encounter that is missing was in HCGH ED and never made it to ICU
+missing_adt <- adts |> group_by(cohort_id, encounter_block) |>
+  filter(sum(is.na(in_dttm))>0) |> arrange(cohort_id, encounter_block, in_dttm) |> ungroup() |> collect()
+#For Linked Encounters missing ADT Info, Find the Facility WHere the Encounter with no ADT Came frome and Include
+#This is When Someone Starts at One of our EDs and Transferred to ICU in Another Hospital 
+missing_adt <- missing_adt |>
+  filter(is.na(facility))
+missing_adt  <- open_dataset(paste0(data_path, 'derived_adt_location_history')) |>
+  filter(pat_enc_csn_id %in% missing_adt$pat_enc_csn_id) |>
+  filter(adt_department_name!='POST-DISCHARGE') |>
+  collect() |>
+  #Select Last Location in those missing facility
+  group_by(pat_enc_csn_id) |>
+  filter(row_number()==n()) |>
+  ungroup()
+
+#Now remerge with mv_ahrf for these missing and rowbind back into adts table
+df <- mv_ahrf |> select(cohort_id, pat_enc_csn_id, encounter_block, final_admit_date, 
+                        link_group:study_vent_end) |>
+  filter(pat_enc_csn_id %in% missing_adt$pat_enc_csn_id)
+missing_adt <- missing_adt |>
+  mutate(target_icu=if_else(adt_department_name %in% target_icus, 1, 0)) |>
+  join(df, how = 'left')
+rm(df)
+
+adts <- adts |>
+  filter(!is.na(facility)) |> #Filter Out Those with Missing Facility and rowbind with missing adt
+  collect() |>
+  rowbind(missing_adt) |>
+  arrange(cohort_id, in_dttm) 
+rm(missing_adt)
+
+#Some ADT Observations Are The Same Location with Very Little Time in Between (Define > 24 Hours between Same Observations as New Admission)
+#Filter to Only Transitions between Distinct Unit Types and Collapse those with short distance between into one unit
+adts <- adts |>
+  group_by(pat_enc_csn_id) |>
+  arrange(pat_enc_csn_id, in_dttm) |>
+  #Mark Each Transition to a New ADT location
+  mutate(new_unit=case_when(
+    row_number()==1 ~ 1,
+    row_number()>1 & adt_department_name!=lag(adt_department_name) ~ 1,
+    TRUE ~ 0)) |>
+  #Create a Variable of Unit Number for Each New Unit
+  group_by(pat_enc_csn_id, new_unit) |>
+  mutate(temp=row_number()) |>
+  mutate(unit_number=fifelse(new_unit==1, temp, NaN)) |>
+  group_by(pat_enc_csn_id) |>
+  fill(unit_number, .direction = 'down') |>
+  #Select First and Last Row For Each Unit Number and Redefine in and out dttm
+  group_by(pat_enc_csn_id, unit_number) |>
+  filter(row_number()==1 | row_number()==n()) |>
+  mutate(unit_in_dttm=fcase(
+    row_number()==1, in_dttm
+  )) |>
+  mutate(unit_out_dttm=fcase(
+    row_number()==n(), out_dttm
+  )) |>
+  fill(unit_in_dttm, unit_out_dttm, .direction = 'downup') |>
+  filter(row_number()==1) |>
+  ungroup() |>
+  select(cohort_id, pat_enc_csn_id, adt_department_name, facility:unit_out_dttm, - temp, -new_unit)
+
+#This Table Defines The Encounter (encounter block level) where eligible MV was received
+#Calculate Grouped by Target and Non-Target ICUs
+#Once Calculated Keep the First ICU In Which Criteria are Met (per encounter block)
+icu_mv <- adts |>
+ group_by(target_icu) |>
+ mutate(timefromvent=as.duration(unit_in_dttm-study_vent_start)/dhours(1)) |> #Negative number means vent started after ICU in time
+#Label Units Where >12 Hours of MV Occurred AND Occurred within 48 hours of Vent Start
+  #Here Can Calculate at the Row Level not the filled in Encounter Block Level
+  mutate(eligible_unit=fifelse(
+    as.duration(study_vent_end-unit_in_dttm)>=dhours(12) & #More than 12 hours from Entrance to ICU to Vent End
+    as.duration(unit_out_dttm-unit_in_dttm)>=dhours(12) & #More than 12 hours in Unit
+    timefromvent<=48 & #No more than 48 Hours of Ventilation prior to ICU entrance
+    as.duration(unit_out_dttm-study_vent_start)>=dhours(12) & #More than 12 hours of Vent in that Unit
+    study_vent_start<unit_out_dttm, 1, 0 #Vent Was Started Prior to that Unit
+  )) |>
+ mutate(icu_vent=case_when(
+    eligible_unit==1 ~ adt_department_name,
+    eligible_unit == 0 & study_vent_start >= unit_in_dttm & study_vent_start < unit_out_dttm ~ adt_department_name,
+  eligible_unit == 0 & timefromvent <= 48 & as.duration(unit_out_dttm - study_vent_start) >= dhours(12) & study_vent_start < unit_out_dttm ~ adt_department_name
+)) |>
+ #Mark the ICU in time to use for calculating ICU length of stay
+  group_by(cohort_id, encounter_block) |> #Calculate for Both Target and 'off target' ICUs
+  arrange(cohort_id, encounter_block, unit_in_dttm) |>
+  mutate(icu_admit=fcase(row_number()==min(row_number()), adt_department_name)) |>
+  fill(icu_vent, icu_admit, .direction = "downup") |>
+  ungroup()
+  
+
+#Keep Track of Units Where < 24 Hours Was Spent Before Transfer
+#BUT, otherwise Keep Only 1st Unit that is Eligible (per encounter block)
+icu_mv <- icu_mv |>
+  #Now Label Times Where Someone Transfers Out On Vent Within 24 Hours of Vent Start
+  mutate(less_than24hrs_unit=fifelse(as.duration(unit_out_dttm-study_vent_start)/dhours(1)<24, 1, 0)) |>
+  #IF there are both ineligible and eligible rows, keep the first eligible row
+  group_by(cohort_id, encounter_block) |>
+  arrange(cohort_id, unit_in_dttm) |>
+  #Identify Units that are What is Wanted for Cohort
+  mutate(temp=fifelse(target_icu==1 & eligible_unit==1, 1, 0)) |>
+  mutate(drop=fcase(
+    temp==0 & sum(temp)>=1, 1,
+    default = 0
+  )) |>
+  filter(drop==0) |> 
+  filter(row_number()==1) |> #Keep First Eligible Unit Per Encounter Block OR the drop filter above keeps a row if it is not eligible if there are no eligible rows
+  ungroup() |>
+  select(-temp, -drop)
+  
+#Now Calculate ICU Length of Stay (consider > 24 hours out of ICU as the index ICU length of Stay)
+#Will Need to Merge Back in Data from icu_MV to adts
+temp <- icu_mv |> select(cohort_id, encounter_block, unit_in_dttm) |>
+  mutate(first=1)
+temp1 <- adts |> filter(cohort_id %in% icu_mv$cohort_id) |>
+  left_join(temp) |>
+  group_by(cohort_id, encounter_block) |>
+  arrange(cohort_id, unit_in_dttm) |>
+  #Now we have a Table with All ICUs and icu-vent is only filled in starting for unit where criteria are met
+  mutate(temp=first) |>
+  fill(temp, .direction = 'down') |>
+  filter(temp==1) |>
+  #Now Define ICU Stays and ICUin and ICUout times
+  mutate(new_icu=case_when(
+    row_number()==1 ~ 1,
+    row_number()>1 & as.duration(unit_in_dttm-lag(unit_out_dttm)>dhours(24)) ~ 1,
+    TRUE ~ 0)) |>
+  group_by(cohort_id, encounter_block, new_icu) |>
+  mutate(temp=row_number()) |>
+  mutate(icu_number=fifelse(new_icu==1, temp, NaN)) |>
+  group_by(cohort_id, encounter_block) |>
+  fill(icu_number, .direction = 'down') |>
+  #Select First and Last Row For Each Unit Number and Redefine in and out dttm
+  group_by(pat_enc_csn_id, icu_number) |>
+  filter(row_number()==1 | row_number()==n()) |>
+  mutate(icu_in_dttm=fcase(
+    row_number()==1, unit_in_dttm
+  )) |>
+  mutate(icu_out_dttm=fcase(
+    row_number()==n(), unit_out_dttm
+  )) |>
+  mutate(icu_dc = fcase(row_number()==n(), adt_department_name)) |>
+  fill(icu_in_dttm, icu_out_dttm, icu_dc, .direction = 'downup') |>
+  filter(first==1) |>
+  ungroup() |>
+  select(cohort_id, encounter_block, icu_in_dttm, icu_out_dttm, icu_dc)
+  
+#Merge Back Into icu_mv dataset
+icu_mv <- icu_mv |>
+ left_join(temp1, by = c('cohort_id', 'encounter_block')) |>
+ select(cohort_id, pat_enc_csn_id, encounter_block, facility, encounter_block, unit_in_dttm:unit_out_dttm, icu_vent:icu_dc, less_than24hrs_unit, target_icu, eligible_unit) |>
+ relocate(icu_dc, .after = icu_admit)
+
+#Create a Master eligible dataset that contains oxygenation and ICU data and selects the .csn where eligibility is met
+mv_eligible <- mv_ahrf |>
+  left_join(icu_mv) |>
+  filter(target_icu==1 & eligible_unit==1)
+
+#Add LPV Time Zero - This is Different than Study_vent_start in that if a patient is started on vent in the 48 hours prior to being in an eligible ICU the start time for LPV assessment will be ICU admission time
+mv_eligible <- mv_eligible |>
+  mutate(lpv_time_zero=fcase(
+    study_vent_start>=icu_in_dttm, study_vent_start,
+    study_vent_start<icu_in_dttm, icu_in_dttm
+  )) |>
+  relocate(lpv_time_zero, .after = study_vent_end)
+
+
+#Keep Track for Consort
+cat('For Consort: ', length(unique(mv_ahrf$pat_enc_csn_id))-length(unique(mv_eligible$pat_enc_csn_id)), 'encounters excluded for no eligible ventilation in a study ICU \n')
+cat('For Consort: ', length(unique(mv_ahrf$cohort_id))-length(unique(mv_eligible$cohort_id)), 'patients excluded for no eligible ventilation in a study ICU \n')
+cat('   yielding: ', length(unique(mv_eligible$pat_enc_csn_id)), 'eligible encounters amongst,', 
+    length(unique(mv_eligible$cohort_id)), 'patients \n')
+
+rm(temp, temp1, icu_mv, adt_total)
+###NOTES: Here icu_in_dttm is always equal to unit_in_dttm, but icu_out_dttm takes into account if a patient transfers to different ICUs and take the last time a patient was in an ICU in this index ICU stay
+#So icu_in_dttm can be considered ICU length of stay for this study, while unit in dttm and unit-out-dttm are for the individual ICU
+```
+
+#Now that Cohort is Defined (All first-stage exclusions implemented) Start Building Needed Data Elements
+```{r Build a Demographics and Outcomes Table, Based on Encounters Table}
+#Goal is To Extract 1 Row of Demographics and Outcomes Per Encounter Block
+#his means for Admit Variables Keep First Row of an Encounter Block
+#For DC Variables keep Last Row of an Encounter Block
+
+#Re-extract list of cohort_id and encounter blocks for merging
+encounter_block <- mv_eligible |>
+  distinct(cohort_id, encounter_block) |>
+  mutate(in_cohort=1)
+
+demos_outcomes <- encounters |>
+  join(encounter_block, how = 'left') |>
+  filter(in_cohort==1) |> #Filter to Encounter Blocks Included in the Cohort
+  #Non-white Race
+  mutate(nonwhite=fcase(
+    is.na(race), NaN,
+    race=='White', 0,
+    default = 1
+  )) |>
+  #Admission Type - This is Hospital Level
+  mutate(admit_type_hospital=fcase(
+    hosp_admsn_type_c %in% c(1,2,5), 'Emergency',
+    hosp_admsn_type_c==3, 'Elective',
+    hosp_admsn_type_c==15, 'Psychiatric',
+    hosp_admsn_type_c %in% c(13,18), 'Obstetric',
+    default = NA_character_
+  )) |>
+  #Was Patient Transferred?
+  mutate(transfer_to_jhhs=fcase(
+    admit_source %in% c('Another Acute Care Hospital Inpatient Service For Any Reason', 'Admit from Other Acute Hospital',
+          'From Other Hosp to TRA/BURN/NICU',
+          'Transfer From Hospital',
+          'Transfers from another acute care hospital or ED',
+          'Another acute care OP ED or freestanding ED.',
+          'Transfer from a Designated Disaster Alternative Care Site (ACS)'),
+    1,
+    default = 0
+  )) |>
+  #Format Death and Other Outcomes
+  #Define in Hospital Death
+  mutate(inhosp_death=fifelse(
+    disc_disp %in% 
+      c('Expired',
+        'Expired Medical Facility-hospital, SNF, ICF, free standing hospice-claim for hospice', 
+        'Expired - Place Unknown (Medicare and TRICARE claims for hospice care)'), 1, 0
+  )) |>
+  #If Final DC Date is Missing, Patient is STill Admitted As of Time of Data Pull 
+  mutate(inhosp_death=fifelse(
+    is.na(final_dc_date), NaN, inhosp_death
+  )) |>
+  #Now Define Death THat Occurs After Hospitalization 
+  mutate(dead=fcase(
+    inhosp_death==1, 1,
+    inhosp_death==0 & !is.na(death_date), 1,
+    inhosp_death==0 & is.na(death_date), 0
+  )) |>
+  mutate(death_date=fifelse(
+    inhosp_death==1, hosp_disch_time, death_date)) |>
+ relocate(death_date, .after = dead) |>
+#Define Hospice
+mutate(dc_hospice=fifelse(
+    disc_disp %in% c('Home Hospice', 'Hospice Facility', 'Hospice Home', 'Inpatient Hospice'), 1, 0
+  )) |>
+  #If disc_disp missing, keep dc_hospice missing
+  mutate(dc_hospice=fifelse(
+    is.na(disc_disp) | is.na(final_dc_date), NaN, dc_hospice
+  )) |>
+  #Select Needed Variables
+  group_by(cohort_id, encounter_block) |>
+  arrange(cohort_id, encounter_block, hosp_admsn_time) |>
+  #For Admission Variables Use First Observation Per Encounter Block
+  #For Outcome Variables Use Last Observation Per Encounter Block
+  mutate(inhosp_death=fifelse(row_number()==n(), inhosp_death, NaN)) |>
+  mutate(dc_hospice=fifelse(row_number()==n(), dc_hospice, NaN)) |>
+  mutate(disc_disp=fifelse(row_number()==n(), disc_disp, NA_character_)) |>
+  mutate(disch_destination=fifelse(row_number()==n(), 
+                                   disch_destination, NA_character_)) |>
+  fill(inhosp_death, dc_hospice, 
+       disc_disp, disch_destination, .direction = 'up') |>
+  filter(row_number()==1) |>
+  ungroup() |>
+  select(cohort_id:admit_source, disc_disp, ed_visit_yn, transfer_from:birth_date, gender:dc_hospice, -pat_enc_csn_id)
+```
+```{r Remake the ICU Admissions Table for This Specific Project}
+in_cohort <- encounters |>
+  join(encounter_block, how ='left') |>
+  select(cohort_id, pat_enc_csn_id, encounter_block, in_cohort) |>
+  filter(in_cohort==1) 
+
+#Reopen adt_icu_admits
+adt_icu_admits <- open_dataset(paste0(data_path, 'derived_adt_location_history')) |>
+  left_join(in_cohort) |>
+  filter(in_cohort==1) |>
+  collect() |>
+  mutate(in_icu=fifelse(adt_department_name %in% all_icus, 1, 0)) |>
+  group_by(pat_enc_csn_id) |>
+  mutate(ever_icu=fifelse((sum(in_icu, na.rm = TRUE)>0), 1, 0)) |> #Labels 'ever_icu=1' if during that encounter the patient had an adt department location on the icu list
+  ungroup() |>
+  filter(ever_icu==1)
+
+#Refine This Table to Contain 1 Row for Each Individual ICU Admission
+#Other Variables of Interest are: Whether Patient Admitted from ED to ICU, Directly Admitted to ICU, Transferred to ICU after different unit, ICU readmission, Discharge from ICU, Use "Periop" to Indicate Surgical Admit?
+adt_icu_admits <- adt_icu_admits |>
+  #Define the ED
+  mutate(emergency_dept=fifelse(
+    (grepl("emerg", adt_department_name, ignore.case = TRUE)==TRUE), 1, 0)) |>
+  #Remove Trips to Cath Lab/IR This Will Help Define ED to ICU admits that Pass THrough Cath or IR
+  filter(adt_department_name %!in% 
+           c("HCGH IRCV LAB",
+             "SH IR LAB",
+             "JHH CVIL",
+             "SH CV LAB",
+             "ZDEAC JHH ZAYED 5 CVIL",
+             "ZDEAC JHH ZAYED 3 IRC",
+             "JHH ZAYED NEURO IR",
+             "SMH IRCV LAB",
+             "BMC CVIL",
+             "ZDEAC JHH ZAY 4W ECHO",
+             "ZDEAC JHH NIR3",
+             "JHH ZAYED IR"
+             )) 
+
+#Easier to Do on Smaller Subset of Data And then merge Back In
+ed_define <- adt_icu_admits |>
+  #Now Define ED to ICU Admits
+  group_by(pat_enc_csn_id) |>
+  #Filter out Observations where ED is listed Multiple Times
+  mutate(out=fifelse(
+    (row_number()>1 & emergency_dept==1), 1, 0)) |>
+  filter(out==0) |>
+  #Now Can Filter to Encounters that Start with An ED Visit, and then Where Patient Goes from There
+  filter((row_number()==1 & emergency_dept==1) | row_number()==2) |>
+  mutate(keep=fifelse((emergency_dept==1 & event_type=="Admission"), 1,0)) |>
+  filter(sum(keep, na.rm=TRUE)>0) |>
+  mutate(ed_to_icu=fifelse(
+    (row_number()==2 & in_icu==1),1,0)) |>
+  mutate(ed_to_or=fifelse(
+    (row_number()==2 & 
+       (grepl("periop", adt_department_name, ignore.case=TRUE)==TRUE |
+          grepl("intraop", adt_department_name, ignore.case=TRUE)==TRUE)),1,0)) |>
+  filter(row_number()==2) |>
+  select(pat_enc_csn_id, ed_to_icu, ed_to_or) |>
+  ungroup()
+ 
+#Merge With adt_icu_admits and Create Direct to ICU Variable, Elective Surgical Admit
+adt_icu_admits <- adt_icu_admits |>
+  left_join(ed_define) |>
+  mutate(direct_icu=case_when( #This is When Patient Admitted Directly to ICU
+    event_type=="Admission" & in_icu==1 ~ 1)) |>
+  mutate(elective_surg=case_when( #Will consider "Elective Surgery" Admission that Begins in OR
+    (event_type=="Admission" &
+      grepl("periop", adt_department_name, ignore.case=TRUE)==TRUE) ~ 1)) |>
+  group_by(pat_enc_csn_id) |>
+  fill(direct_icu, .direction = "down") |>
+  fill(elective_surg, .direction = "down") |>
+  ungroup() |>
+  #Code Below Makes Missing Data 0
+  mutate(ed_to_icu=fifelse(is.na(ed_to_icu), 0, ed_to_icu)) |>
+  mutate(ed_to_or=fifelse(is.na(ed_to_or), 0, ed_to_or)) |>
+  mutate(direct_icu=fifelse(is.na(direct_icu), 0, direct_icu)) |>
+  mutate(elective_surg=fifelse(is.na(elective_surg), 0, elective_surg))
+
+#For Next Piece of CODE, MUCH faster to implement lead/lag functions wiht data.table
+#Want to Determine How Many Distinct ICU Periods There Were
+#Orders Admits by Date and then within that sorted by enc_id and then in_dttm
+test_icu <- setDT(adt_icu_admits)[in_icu==1][order(contact_date, pat_enc_csn_id, in_dttm)] 
+#Calculate Time Between Leaving One ICU and entering another)
+test_icu[, ':='(prev_icu_out = data.table::shift(out_dttm, n=1, type = "lag")), by = pat_enc_csn_id]
+#Now, if < 24 hours between leazving one ICU encounter and entering another will count as same ICU perid
+#Uses the 'difftime' function from 'data.table' to calculate time difference, and labels those with > 24 hours in between as distinct
+test_icu[, time_diff_out := difftime(in_dttm, prev_icu_out, units = "hours")]
+#Now use 'fcase' [like case_when] to signify whether row is a distinct ICU admission or not, and number those
+test_icu[, rown := 1:.N, by = pat_enc_csn_id
+  ][, distinct_icu := fcase(
+  rown==1, 1,
+  rown!=1 & time_diff_out>=24, 1), by = pat_enc_csn_id]
+#Create a Table of Distinct ICU Encounters and Number Them and then Will Merge Back
+distinct_icu_csn <- test_icu[distinct_icu==1][, icu_number := 1:.N, by = pat_enc_csn_id][,.(pat_enc_csn_id, in_dttm,icu_number)]
+#Now left_join (with data.table syntax) *just as fast in DPLYR) and then fill in icu_number
+test_icu <- left_join(test_icu, distinct_icu_csn)
+test_icu <- setDT(test_icu)[,icu_number := nafill(icu_number, type= "locf"), by = pat_enc_csn_id]
+rm(distinct_icu_csn)
+
+#Now Select First and Last in_dttm and out_dttm for each ICU number
+test_icu[, icu_in_dttm := data.table::first(in_dttm), by = .(pat_enc_csn_id, icu_number)]
+test_icu[, icu_out_dttm := data.table::last(out_dttm), by = .(pat_enc_csn_id, icu_number)]
+
+# Saves a "long version" of Dataset (has each individual ICU for ICU-ICU transfers)
+test_icu <- as_tibble(test_icu) |>
+  select(cohort_id:in_icu, ed_to_icu:elective_surg, icu_number, icu_in_dttm, icu_out_dttm)
+adt_icu_admits <- test_icu
+# Saves a condensed version of Dataset includes first for each ICU number
+icu_admits <- test_icu |>
+  group_by(pat_enc_csn_id, icu_number) |>
+  filter(row_number()==1) |>
+  select(-in_dttm, -out_dttm) |>
+  ungroup()
+
+#Remove Uneeded Files
+rm(ed_define, no_icu, no_icu_test, sometimes_icus, test_icu)
+
+#Save the filtered adt_icu_admits and icu_admits as Parquet files
+write_parquet(adt_icu_admits, here::here('data', 'lpv_adt_icu_admits.parquet'))
+write_parquet(icu_admits, here::here('data', 'lpv_icu_admits.parquet'))
+rm(adt_icu_admits, icu_admits)
+```
+
+
+```{r Add ICU Admission Type and Starts on Vent to demos_outcomes table}
+#Select Index Time for ICU Start in the LPV Cohort
+icu_time <- mv_eligible |>
+  select(cohort_id, encounter_block, icu_in_dttm) |>
+  rename(index_icu_time = icu_in_dttm)
+
+#Merge with ICU Admits, and Select The ICU where This Index Time STarts with Or is in Between
+icu_admit_type <- open_dataset(here::here('data', 'lpv_icu_admits.parquet')) |>
+  left_join(icu_time) |>
+  filter(index_icu_time >= icu_in_dttm & index_icu_time<=icu_out_dttm) |>
+  collect() |>
+  select(cohort_id, encounter_block, ed_to_icu:elective_surg, facility) |>
+  rename(hospital=facility)
+
+#Identify Patients Who's First Oxygen Device is a Ventilator
+arrive_vent <-  open_dataset(paste0(data_path, 'o2_devices_short')) |>
+  filter(pat_enc_csn_id %in% mv_eligible$pat_enc_csn_id) |>
+  group_by(pat_enc_csn_id) |>
+  arrange(pat_enc_csn_id, recorded_time) |>
+  collect() |>
+  filter(row_number()==1) |>
+  mutate(first_obs_on_vent=fifelse(o2_status_c=='invasive mv', 1, 0)) |>
+  select(cohort_id, pat_enc_csn_id, first_obs_on_vent) |>
+  ungroup()
+
+#Identify CSn/Encounter Blocks in Cohort
+csn_blocks <- mv_eligible |>
+  select(cohort_id, pat_enc_csn_id, encounter_block)
+
+#Add Encounter Block to arrive_vent (demos_outcomes dataframe doesn't have CSN)
+arrive_vent <- arrive_vent |> join(csn_blocks, how = 'left') |>
+  select(-pat_enc_csn_id)
+
+#Merge with Demos and OUtcomes
+demos_outcomes <- demos_outcomes |>
+  join(icu_admit_type, how = 'left') |>
+  join(arrive_vent, how = 'left') |>
+  mutate(vent_at_osh=fifelse(transfer_to_jhhs==1 & first_obs_on_vent==1, 1, 0))
+
+rm(icu_time, icu_admit_type, arrive_vent)
+```
+
+
+```{r Pull in Elixhauser Comorbidity Counts and Weighted Indices}
+#PMID: 28498196
+#Uses 2024 Updates for Elixhauser Mapping: https://hcup-us.ahrq.gov/toolssoftware/comorbidityicd10/comorbidity_icd10.jsp
+
+#Bring in the AHRQ Processed Elixhauser
+ahrq_elixhauser <- open_dataset(paste0(data_path, 'elixhauser_index_output.parquet')) |>
+  #Select Needed Columns
+  select(CMR_VERSION, pat_enc_csn_id, CMR_AIDS:CMR_WGHTLOSS, 
+         CMR_Index_Readmission, CMR_Index_Mortality) |>
+  filter(pat_enc_csn_id %in% csn_blocks$pat_enc_csn_id) |>
+  collect()
+
+#Rows to Calcuate for Sum
+comorbids <- ahrq_elixhauser |> select(CMR_AIDS:CMR_WGHTLOSS) |> names()
+
+#Calculate Comorbidity Count
+ahrq_elixhauser <- ahrq_elixhauser |>
+  mutate(elixhauser_count=rowSums(ahrq_elixhauser[comorbids], na.rm=TRUE))
+
+write_parquet(ahrq_elixhauser, here::here('data', 'lpv_cohort_elixhauser.parquet'))
+
+ahrq_elixhauser <- ahrq_elixhauser |>
+  select(pat_enc_csn_id, CMR_Index_Readmission, CMR_Index_Mortality, elixhauser_count) |>
+  join(csn_blocks, how = 'left') |>
+  select(-pat_enc_csn_id)
+
+demos_outcomes <- demos_outcomes |> join(ahrq_elixhauser, how = 'left')
+rm(ahrq_elixhauser)
+```
+```{r Now define HCUP CCS Categorie}
+#Uses 2024 Updates for CCS: https://hcup-us.ahrq.gov/toolssoftware/ccsr/DXCCSR-User-Guide-v2021-1.pdf
+#For Now Will Use Default or Primary Diagnosis
+ccsr_output <- open_dataset(paste0(data_path, 'ccsr_output.parquet')) |>
+  filter(pat_enc_csn_id %in% mv_eligible$pat_enc_csn_id) |>
+  filter(primary_ccsr==1) |>
+  select(pat_enc_csn_id, ccsr_abbrev:ccsr_category) |>
+  left_join(csn_blocks) |> #Need Encounter Block to Merge with Demos Outcomes
+  collect()
+
+demos_outcomes <- demos_outcomes |>
+  join(ccsr_output, how = 'left') |>
+  mutate(covid_ccsr_dx=fifelse(
+    ccsr_category=='Coronavirus disease – 2019 (COVID-19)', 1, 0
+  ))
+
+covid_19 <- open_dataset(paste0(data_path, 'hospital_billing_dx')) |>
+  filter(pat_enc_csn_id %in% csn_blocks$pat_enc_csn_id) |>
+  filter(icd10_code=='U07.1' | icd10_code=='J12.82') |>
+  filter(present_on_admission=='Yes') |>
+  left_join(csn_blocks) |>
+  collect() |>
+  group_by(cohort_id, encounter_block) |>
+  filter(row_number()==1) 
+
+demos_outcomes <- demos_outcomes |>
+  mutate(covid_icd10_poa=fifelse(
+    pat_enc_csn_id %in% covid_19$pat_enc_csn_id, 1, 0
+  )) |>
+  select(-pat_enc_csn_id)
+rm(ccsr_output, covid_19)
+```
+
+
+```{r Get Height, Weight and Calculate BMI}
+temp <- c('WEIGHT/SCALE', 'HEIGHT', 'R BMI')
+bmi_vars <- open_dataset(paste0(data_path, 'epic_vitals')) |> 
+  filter(meas_name %in% temp) |>
+  filter(cohort_id %in% in_cohort$cohort_id) |> #Collects Both Index Encounter CSN and those of LInked Encounters
+  filter(!is.na(meas_value)) |> #Non-missing Values Only
+  mutate(cohort_id=as.character(cohort_id)) |>
+  #Filter Out Outliers Here
+  mutate(meas_value=as.numeric(meas_value)) |>
+  mutate(temp_kg=if_else(meas_name=='WEIGHT/SCALE', (meas_value/35.274), NaN)) |>
+  collect()
+rm(temp)
+
+print('Histogram of Height in Inches - Pre Outlier Handling')
+hist(bmi_vars$meas_value[bmi_vars$meas_name=='HEIGHT'])
+summary(bmi_vars$meas_value[bmi_vars$meas_name=='HEIGHT'])
+
+print('Histogram of Weight in Kg - Pre Outlier Handling')
+hist(bmi_vars$temp_kg[bmi_vars$meas_name=='WEIGHT/SCALE'])
+summary(bmi_vars$temp_kg[bmi_vars$meas_name=='WEIGHT/SCALE'])
+
+print('Histogram of BMI - Pre Outlier Handling')
+hist(bmi_vars$meas_value[bmi_vars$meas_name=='R BMI'])
+summary(bmi_vars$meas_value[bmi_vars$meas_name=='R BMI'])
+
+bmi_vars <- bmi_vars |>
+  mutate(out=fcase(
+    temp_kg>1100 | temp_kg<20, 1,
+    meas_name=='HEIGHT' & (meas_value<30 | meas_value>96), 1,
+    meas_name=='R BMI' & (meas_value<8 | meas_value>110), 1
+  )) |>
+  filter(out!=1 | is.na(out))
+
+print('Histogram of Height in Inches - post Outlier Handling')
+hist(bmi_vars$meas_value[bmi_vars$meas_name=='HEIGHT'])
+summary(bmi_vars$meas_value[bmi_vars$meas_name=='HEIGHT'])
+
+print('Histogram of Weight in Kg - post Outlier Handling')
+hist(bmi_vars$temp_kg[bmi_vars$meas_name=='WEIGHT/SCALE'])
+summary(bmi_vars$temp_kg[bmi_vars$meas_name=='WEIGHT/SCALE'])
+
+print('Histogram of BMI - post Outlier Handling')
+hist(bmi_vars$meas_value[bmi_vars$meas_name=='R BMI'])
+summary(bmi_vars$meas_value[bmi_vars$meas_name=='R BMI'])
+
+bmi_vars <- as_arrow_table(bmi_vars)
+
+#Merge in Time in the ICU and Take Height/Weight Closest to That Time Period
+temp <- mv_eligible |> select(cohort_id, encounter_block, icu_in_dttm, final_admit_date) |>
+  mutate(cohort_id=as.character(cohort_id))
+
+bmi_temp <- bmi_vars |>
+  filter(pat_enc_csn_id %in% in_cohort$pat_enc_csn_id) |>
+  left_join(in_cohort) |> #Brings in Encounter Blocks
+  select(-pat_enc_csn_id) |>
+  left_join(temp) |>
+  arrange(encounter_block, recorded_time) |>
+  collect() |>
+  mutate(admit_to_vital=as.duration(icu_in_dttm-recorded_time)/dhours(1)) |>
+  group_by(cohort_id, encounter_block, meas_name) |>
+  mutate(use=fifelse(abs(admit_to_vital)==min(abs(admit_to_vital)), 1, 0)) |>
+  filter(use==1) |>
+  filter(row_number()==1) |> #If Multiple Met Criteria Use One Prior to ICU Admission
+  ungroup()
+
+bmi_temp <- bmi_temp |>
+  #If duplicates, keep first one
+  select(cohort_id, encounter_block, meas_name, meas_value) |>
+  mutate(meas_value=as.numeric(meas_value)) |>
+  pivot_wider(id_cols = c('cohort_id', 'encounter_block'),
+              names_from = meas_name,
+              values_from = meas_value) |>
+  rename(height_inches = HEIGHT, weight_kg = 'WEIGHT/SCALE', bmi = 'R BMI') |>
+  mutate(weight_kg=weight_kg/35.274)
+  
+missing_height_weight <- mv_eligible |>
+  select(cohort_id, encounter_block, icu_in_dttm) |> #Keep Admit Date Here
+  join(bmi_temp, how = 'left') |>
+  filter(is.na(weight_kg) | is.na(height_inches)) |>
+  mutate(link_time=icu_in_dttm) #This will be for linking to the vitals table
+
+#Looking by Cohort ID Level to Grab Closest Height/Weight to Admission Time
+miss_process <- bmi_vars |>
+  filter(cohort_id %in% missing_height_weight$cohort_id) |>
+  filter(meas_name %in% c('WEIGHT/SCALE', 'HEIGHT', 'R BMI')) |>
+  mutate(link_time=recorded_time) |>
+  collect() |>
+  full_join(missing_height_weight, by = c('cohort_id', 'link_time')) |>
+  group_by(cohort_id) |>
+  arrange(cohort_id, recorded_time) |>
+  fill(icu_in_dttm, weight_kg, height_inches, .direction = 'downup') |>
+  mutate(time_to_admit=as.duration(icu_in_dttm-recorded_time)/ddays(1)) |>
+  mutate(keep=fcase(
+    meas_name=='WEIGHT/SCALE' & is.na(weight_kg) & time_to_admit<=365, 1, # Can Use Weights from Past Year
+    meas_name=='HEIGHT' & is.na(height_inches), 1, #Can Use Any Height
+    default=0
+  )) |>
+  filter(keep==1) |>
+  group_by(cohort_id, meas_name) |>
+  mutate(keep=fifelse(abs(time_to_admit)==min(abs(time_to_admit)), 1, 0)) |> #Filters to Closest Value to ICU In Date
+  ungroup() |>
+  filter(keep==1) |>
+  #This fills in an additional 74 missing variables
+  #Select Variables for Merging Back Into BMI Dataset
+  select(cohort_id, icu_in_dttm, meas_value, meas_name) #Will Merge by ICU IN DTTM so it is Encounter Specific
+
+bmi_final <- bmi_temp |>
+  join(temp, how = 'left') |>
+  join(miss_process, how = 'full') |>
+  mutate(weight_kg=fifelse(
+    is.na(weight_kg) & meas_name=='WEIGHT/SCALE', as.numeric(meas_value)/35.274, weight_kg
+  )) |>
+  mutate(height_inches=fifelse(
+    is.na(height_inches) & meas_name=='HEIGHT', as.numeric(meas_value), height_inches)) |>
+  mutate(height_inches=round(height_inches, digits = 0)) |> #Round Inches to Integers (mirrors how clinicians use for IBW calculation)
+  mutate(bmi=fifelse(
+    is.na(bmi), weight_kg/((height_inches/39.37)^2), bmi
+  ))
+ 
+#Merge Back Into Demos and Outcomes
+demos_outcomes <- demos_outcomes |> 
+  join(bmi_final, how = 'left') 
+
+rm(bmi_vars, bmi_temp, bmi_final, miss_process, missing_height_weight, temp)
+```
+
+
+```{r Non-respiratory SOFA Score and Vasoactives}
+####Cardiovascular SOFA
+#Start with MAP
+cv_sofa <- open_dataset(paste0(data_path, 'mean_art_pressure')) |>
+  mutate(cohort_id = as.character(cohort_id)) |>
+  filter(cohort_id %in% in_cohort$cohort_id) |>
+  left_join(in_cohort) |>
+  select(cohort_id, pat_enc_csn_id, encounter_block, meas_value, recorded_time) |>
+  rename(map=meas_value) |>
+  mutate(map_sofa=case_when(
+      map>=70 ~ 0, 
+      map<70 ~ 1
+    )) |>
+  compute()
+#NOTE: Distribution of MAP in this Data; Will Leave as Is Without Further Outlier Filtering
+#NOTE:Min. 1st Qu.  Median    Mean 3rd Qu.    Max. 
+  #   20.00   72.00   81.00   83.45   93.00  250.00 
+
+#Bring in Vasoactives
+vasoactives <- open_dataset(paste0(data_path, 'vasoactives')) |>
+  mutate(cohort_id = as.character(cohort_id)) |>
+  filter(cohort_id %in% in_cohort$cohort_id) |>
+  left_join(in_cohort) |>
+  compute()
+
+merge_vaso <- vasoactives |>
+  select(cohort_id, pat_enc_csn_id, encounter_block, taken_time, vasopressor_sofa) |>
+  rename(recorded_time=taken_time)
+
+cv_sofa <- cv_sofa |>
+  full_join(merge_vaso) |>
+  #IF there is a Vasopressor SOFA than that is SOFA, if not it is MAP SOFA
+  mutate(cv_sofa=if_else(
+    !is.na(vasopressor_sofa), vasopressor_sofa, map_sofa
+  )) |>
+  compute()
+
+rm(merge_sofa)
+
+###Renal, Liver, Coag SOFA
+labs_sofa <- open_dataset(paste0(data_path, 'labs_curated')) |>
+  filter(!is.na(coag_sofa) | !is.na(liver_sofa) | !is.na(renal_sofa_creat)) |>
+  mutate(cohort_id = as.character(cohort_id)) |>
+  mutate(pat_enc_csn_id = as.numeric(pat_enc_csn_id)) |>
+  filter(cohort_id %in% in_cohort$cohort_id) |>
+  left_join(in_cohort) |>
+  select(cohort_id, pat_enc_csn_id, encounter_block, lab_name, lab_value, coag_sofa:renal_sofa_creat, specimen_taken_time) |>
+  rename(recorded_time=specimen_taken_time) |>
+  compute()
+
+print('Check Lab Outliers')
+bilirubin_check <- labs_sofa |> 
+  filter(lab_name=='bilirubin_total') |>
+  collect() 
+cat('\n Bilirubin Distribution')
+summary(bilirubin_check$lab_value)
+hist(bilirubin_check$lab_value)
+rm(bilirubin_check)
+
+creatinine_check <- labs_sofa |> 
+  filter(lab_name=='creatinine') |>
+  collect() 
+cat('\n Creatinine Distribution')
+summary(creatinine_check$lab_value)
+hist(creatinine_check$lab_value)
+rm(creatinine_check)
+
+platelet_check <- labs_sofa |> 
+  filter(lab_name=='platelet_count') |>
+  collect() 
+cat('\n Platelet Count Distribution')
+summary(platelet_check$lab_value)
+rm(platelet_check)
+
+#Will Use CLIF Outlier Handlers Similar to What Was Used for Concept Paper (submitted to NEJM-AI)
+labs_sofa <- labs_sofa |>
+  mutate(delete=case_when(
+    lab_name=='bilirubin_total' & lab_value>=80 ~ 1,
+    lab_name=='creatinine' & lab_value>=30 ~ 1,
+    lab_name=='platelet_count' & lab_value>2100 ~ 1,
+    .default = 0
+  )) |>
+  filter(delete==0) |>
+  select(-delete) |>
+  compute()
+  
+
+#Neuro SOFA
+neuro_sofa <- open_dataset(paste0(data_path, 'sedation_delirium')) |>
+  filter(!is.na(cns_sofa)) |>
+  mutate(cohort_id = as.character(cohort_id)) |>
+  mutate(pat_enc_csn_id = as.numeric(pat_enc_csn_id)) |>
+  filter(cohort_id %in% in_cohort$cohort_id) |>
+  left_join(in_cohort) |>
+  select(cohort_id, pat_enc_csn_id, recorded_time, encounter_block, rass, gcs, cns_sofa) |>
+  compute()
+
+#Master SOFA:
+master_sofa <- cv_sofa |>
+  full_join(labs_sofa) |>
+  full_join(neuro_sofa) |>
+  arrange(cohort_id, recorded_time) |>
+  compute()
+rm(cv_sofa, neuro_sofa, labs_sofa)
+write_parquet(master_sofa, here::here('data', 'lpv_master_sofa.parquet'))
+
+#Now Calculate Highest SOFA in the 24 Hours Prior to lpv_time_zero; IF Score is not Available Can Extend to 24 Hour Period AFTER lpv_time_zero
+#1st STart with Defining the Time of Interest
+vent_start <- mv_eligible |>
+  select(cohort_id, encounter_block, lpv_time_zero, study_vent_start)
+
+#Calculate Each SOFA Subscore and Create Table to Merge Back to Demos_Outcomes
+master_sofa <- master_sofa |>
+  left_join(vent_start) |>
+  collect() |>
+  mutate(time_diff=as.duration(lpv_time_zero-recorded_time)/dhours(1)) |>
+  mutate(time_group=fcase(
+    time_diff>=-24 & time_diff<=0, 1,
+    time_diff>0 & time_diff<=24, 2
+  )) |>
+  filter(!is.na(time_group)) |>
+  group_by(cohort_id, encounter_block, time_group) |>
+  mutate(max_cns_sofa=max(cns_sofa, na.rm = TRUE)) %>%
+    mutate(max_cns_sofa=if_else(max_cns_sofa==-Inf, NaN, max_cns_sofa)) %>%
+    mutate(max_cv_sofa=max(cv_sofa, na.rm = TRUE)) %>%
+    mutate(max_cv_sofa=if_else(max_cv_sofa==-Inf, NaN, max_cv_sofa)) %>%
+    mutate(max_liver_sofa=max(liver_sofa, na.rm = TRUE)) %>%
+    mutate(max_liver_sofa=if_else(max_liver_sofa==-Inf, NaN, max_liver_sofa)) %>%
+    mutate(max_coag_sofa=max(coag_sofa, na.rm = TRUE)) %>%
+    mutate(max_coag_sofa=if_else(max_coag_sofa==-Inf, NaN, max_coag_sofa)) %>%
+    mutate(max_renal_sofa=max(renal_sofa_creat, na.rm = TRUE)) %>%
+    mutate(max_renal_sofa=if_else(max_renal_sofa==-Inf, NaN, max_renal_sofa)) %>%
+    #Now Keep First Row Only
+    filter(row_number()==1) %>%
+    #Can Fill Missing Values from 24 Hours After Vent for 24 Hours Prior to Vent
+    group_by(cohort_id, encounter_block) |>
+    fill(max_cns_sofa, max_cv_sofa, max_liver_sofa, max_coag_sofa, max_renal_sofa, .direction = 'updown') |>
+    ungroup() |>
+    filter(time_group==1) |>
+  select(cohort_id, encounter_block, max_cns_sofa:max_renal_sofa) #NOTE: Will use individual sub-scores here so can use a variety of imputation strategies should it be desired
+
+demos_outcomes <- demos_outcomes |>
+  join(master_sofa, how = 'left')
+
+###Also Define Maximum Norepi Equivalent in 24 Hours Prior to and up to 12 hours after Time Zero LPV
+norepi_equivalents <- vasoactives |>
+  left_join(vent_start) |>
+  #Define Norepi Equivalents
+  mutate(norepi_equivalent=case_when(
+      (norepi_dose<=0.15 | epi_dose <= 0.15 | phenyl_dose <= 1.5) & pressor_no==1 ~ 1,
+      (norepi_dose> 0.15 | epi_dose > 0.15 | phenyl_dose > 1.5 | dopa_dose > 22) & pressor_no==1 ~ 2,
+      vaso_dose<=0.04 & pressor_no==1 ~ 1,
+      pressor_no > 1 ~ 2,
+      dopa_dose <= 22 & pressor_no==1 ~ 1,
+      pressor_no==0 ~ 0)) |>
+  collect() |>
+  mutate(time_to_lpv=as.duration(taken_time-lpv_time_zero)/dhours(1)) |>
+  filter(time_to_lpv>=-24 & time_to_lpv<=12 & !is.na(norepi_equivalent)) |>
+  group_by(cohort_id, encounter_block) |>
+  mutate(temp_pressor=max(norepi_equivalent, na.rm = TRUE)) |>
+  mutate(vasoactive_use=fifelse(sum(pressor_no)>0, 1, 0)) |>
+  filter(row_number()==1) |>
+  mutate(norepi_equivalent=temp_pressor) |>
+  select(cohort_id, encounter_block, norepi_equivalent, vasoactive_use)
+  
+  
+#Merge Back into Demos Outcomes
+demos_outcomes <- demos_outcomes |>
+  left_join(norepi_equivalents) |>
+  #Missing means there are no documented vasoactives
+  mutate(norepi_equivalent=fifelse(is.na(norepi_equivalent), 0, norepi_equivalent)) |>
+  mutate(vasoactive_use=fifelse(is.na(vasoactive_use), 0, vasoactive_use)) 
+
+rm(master_sofa, merge_vaso, vasoactives, norepi_equivalents)
+```
+
+```{r Code Status}
+#Collect Both from Time of Vent Start and 'Highest' (most restricted) in 1st 24 Hours from LPV Time Zero
+code_status_raw <- open_dataset(paste0(data_path, 'code_status')) |>
+  filter(pat_enc_csn_id %in% in_cohort$pat_enc_csn_id) |>
+  filter(code_status!='Periprocedure Code Status and Care Guidance') |> #Don't Consider Periprocedural
+  left_join(in_cohort) |> #Bring in Encounter Blocks
+  left_join(vent_start) |> #Merge in LPV Time Zero by Encounter Block
+  arrange(cohort_id, encounter_block, activated_inst) |>
+  compute()
+
+#Define Code Status at Time Zero, Code Status at Encounter Start and Encounter End (by Encounter, Block)
+code_status <- code_status_raw |> collect() |>
+  mutate(time_to_lpv=as.duration(activated_inst-lpv_time_zero)/dhours(1)) |> #Time From Code Status Doc to LPV Time Zero
+  #Keep Track of Which Values are Negative or Less than or Equal to 2 Hours After time zero for LPV (Documented at or Prior to LPV Time Zero)
+  mutate(temp_negative=fifelse(
+    time_to_lpv<=0, 1, 0
+  )) |>
+  group_by(cohort_id, encounter_block, temp_negative) |>
+  #Keeps the Code Status Before or at Time Zero for LPV and the First Documented After LPV
+  mutate(temp_code=fcase(
+    temp_negative==1 & time_to_lpv==max(time_to_lpv, na.rm = TRUE), 1,
+    temp_negative==0 & time_to_lpv==min(time_to_lpv, na.rm = TRUE), 1
+  )) |>
+  filter(temp_code==1) |>
+  group_by(cohort_id, encounter_block) |>
+  mutate(code_stat_time0=fifelse(
+    temp_negative==1, code_status, NA_character_
+  )) |>
+  fill(code_stat_time0, .direction ='updown') |>
+  mutate(code_stat_time0=fifelse(
+    is.na(code_stat_time0), code_status, code_stat_time0
+  )) |>
+  #These are all patients who were intubated; some have (DNR/DNI or Comfort Measures Only) prior to intubation but full code or DNR/I after; can choose 1st non-limited (in regard to intubation)
+  mutate(change=fifelse(
+    n()>1 & temp_negative==1 & 
+      (code_stat_time0 %!in% c('CPR - Full Code', 'No CPR - Intubate')),
+    1, NaN
+  )) |>
+  fill(change, .direction = 'down') |>
+  mutate(change=fifelse(is.na(change), 0, 1)) |>
+  mutate(temp_code=code_stat_time0) |>
+  mutate(code_stat_time0=fifelse(change==0, code_stat_time0, NA_character_)) |>
+  #CHange if the Code Status After time zero is Full code or CPR Intubation otherwise keep original
+  mutate(code_stat_time0=fifelse(
+    is.na(code_stat_time0) & n()>1 & temp_negative==0 & change==1 &
+      code_status %in% c('CPR - Full Code', 'No CPR - Intubate'),
+    code_status, code_stat_time0
+  )) |>
+  fill(code_stat_time0, .direction = 'updown') |>
+  mutate(code_stat_time0=fifelse(is.na(code_stat_time0), temp_code, code_stat_time0)) |>
+  select(cohort_id, encounter_block, codestat_start, codestat_end, code_stat_time0) |>
+  filter(row_number()==1) |>
+  ungroup()
+  
+#Code Status at Hours 6,12,24 after time_zero
+temp_status <- code_status_raw |> collect() |>
+  mutate(time_to_lpv=as.duration(activated_inst-lpv_time_zero)/dhours(1)) |>
+  #Code Status at Hour 6 After Time Zero
+  mutate(temp_hour6=fifelse(
+    time_to_lpv<=6, 1, 0
+  )) |> #Marks Observations that Occurred Before Hour 6
+  #Now Take the Code Status at the Maximum Value (Closest to Hour6)
+  group_by(cohort_id, encounter_block, temp_hour6) |>
+  mutate(code_stat_hour6=fcase(
+    time_to_lpv==max(time_to_lpv) & temp_hour6==1,
+    code_status
+  )) |>
+  group_by(cohort_id, encounter_block) |>
+  fill(code_stat_hour6, .direction = 'updown') |>
+  #Essentially Carries Back if No Code Status Generated Until After Hour 6 of LPV
+  mutate(code_stat_hour6=fifelse(
+    is.na(code_stat_hour6) & time_to_lpv==min(time_to_lpv), code_status, code_stat_hour6
+  )) |>
+  fill(code_stat_hour6, .direction = 'updown') |>
+#Code Status at Hour 12 After Time Zero
+  mutate(temp_hour12=fifelse(
+    time_to_lpv<=12, 1, 0
+  )) |> #Marks Observations that Occurred Before Hour 12
+  #Now Take the Code Status at the Maximum Value (Closest to Hour6)
+  group_by(cohort_id, encounter_block, temp_hour12) |>
+  mutate(code_stat_hour12=fcase(
+    time_to_lpv==max(time_to_lpv) & temp_hour12==1,
+    code_status
+  )) |>
+  group_by(cohort_id, encounter_block) |>
+  fill(code_stat_hour12, .direction = 'updown') |>
+  #Essentially Carries Back if No Code Status Generated Until After Hour 12 of LPV
+  mutate(code_stat_hour12=fifelse(
+    is.na(code_stat_hour12) & time_to_lpv==min(time_to_lpv), code_status, code_stat_hour12
+  )) |>
+  fill(code_stat_hour12, .direction = 'updown') |>
+  #Code Status at Hour 24 After Time Zero
+  mutate(temp_hour24=fifelse(
+    time_to_lpv<=24, 1, 0
+  )) |> #Marks Observations that Occurred Before Hour 24
+  #Now Take the Code Status at the Maximum Value (Closest to Hour6)
+  group_by(cohort_id, encounter_block, temp_hour24) |>
+  mutate(code_stat_hour24=fcase(
+    time_to_lpv==max(time_to_lpv) & temp_hour24==1,
+    code_status
+  )) |>
+  group_by(cohort_id, encounter_block) |>
+  fill(code_stat_hour24, .direction = 'updown') |>
+  #Essentially Carries Back if No Code Status Generated Until After Hour 24 of LPV
+  mutate(code_stat_hour24=fifelse(
+    is.na(code_stat_hour24) & time_to_lpv==min(time_to_lpv), code_status, code_stat_hour24
+  )) |>
+  fill(code_stat_hour24, .direction = 'updown') |>
+  ungroup() |>
+  select(cohort_id, encounter_block, code_stat_hour6, code_stat_hour12, code_stat_hour24)
+
+code_status <- code_status |>
+  join(temp_status, how = 'left') |>
+  select(-codestat_start) |>
+  rename(code_stat_end=codestat_end) |>
+  relocate(code_stat_end, .after = code_stat_hour24)
+
+demos_outcomes <- demos_outcomes |>
+  left_join(code_status)
+rm(code_status_raw, temp_status, code_status)
+
+```
+```{r Build Longform Table of Ventilator Measurements That Will Be Used for Outcome Assessment}
+#Use CLIF Format Table
+vent_long <- open_dataset('~/workspace/Storage/chochbe1/JH_CCRD/CLIF/rclif/clif_respiratory_support.parquet') |>
+  rename(cohort_id=patient_id, 
+         pat_enc_csn_id = encounter_id) |>
+  filter(pat_enc_csn_id %in% in_cohort$pat_enc_csn_id) |>
+  distinct() |>
+  compute()
+
+# Filter rows where more than one of the remaining columns has missing values
+vent_long <- vent_long |>
+  filter(!is.na(device_category) | !is.na(device_name) | !is.na(mode_category) | !is.na(mode_name) |
+           !is.na(tidal_volume_set) | !is.na(pressure_support_set) | !is.na(resp_rate_set) | !is.na(lpm_set) |
+           !is.na(peep_set) | !is.na(tidal_volume_obs) | !is.na(plateau_pressure_obs) | !is.na(peak_inspiratory_pressure_set) |
+           !is.na(peak_inspiratory_pressure_obs) | !is.na(resp_rate_obs) | !is.na(phigh) | !is.na(plow)) |>
+  collect() |>
+  group_by(cohort_id, recorded_time) |>
+  filter(row_number()==1) |>
+  ungroup()
+
+#Bring in ECMO Data
+ecmo_summary <- open_dataset('~/workspace/Storage/chochbe1/JH_CCRD/data/ecmo_summary') |>
+  left_join(in_cohort) |>
+  filter(in_cohort==1) |>
+  select(-in_cohort) |>
+  mutate(recorded_time=ecmo_start) |> #Will join by Recorded Time as Full Join in Case of >1 ECMO run per Encounter Block
+  collect() |>
+  filter(ecmo_duration_days>dseconds(0)) 
+ 
+#Merge with Vent Start and Create a Long-form Dataset of the First 72 Hours of MV
+#Need to Merge by Encounter Block
+temp <- vent_long |>
+  join(in_cohort, how = 'left')
+vent_start <- mv_eligible |>
+  select(cohort_id, encounter_block, study_vent_start, study_vent_end, lpv_time_zero)
+weight <- demos_outcomes |>
+  select(cohort_id, encounter_block, gender, height_inches)
+
+vent72 <- temp |>
+  join(ecmo_summary, how = 'full') |>
+  join(vent_start, how = 'full') |>
+  join(weight, how = 'full') |>
+  #Fill in ECMO Start and End - NOTE: Need to do this before filtering by time so we don't miss those on ECMO
+  mutate(temp_ecmo_start=ecmo_start) |>
+  mutate(temp_ecmo_end=ecmo_end) |>
+  group_by(cohort_id, encounter_block) |>
+  arrange(cohort_id, recorded_time) |>
+  fill(temp_ecmo_start, temp_ecmo_end, .direction = 'down') |>
+  mutate(on_ecmo=fifelse(
+    recorded_time>=temp_ecmo_start & recorded_time<=temp_ecmo_end, 1, 0)) |>
+  mutate(on_ecmo=fifelse(is.na(on_ecmo), 0, on_ecmo)) |>
+  group_by(cohort_id, encounter_block, on_ecmo) |>
+  fill(ecmo_start, ecmo_end, ecmo_duration_days, ecmo_type, .direction = 'down') |>
+  ungroup() |>
+  select(-temp_ecmo_start, -temp_ecmo_end) |>
+  #Filter to Values Recorded Within 72 Hours of Time Zero LPV; If Vent Ends Before Hour 72 Only Keep Time on Vent
+  mutate(time_72hours=lpv_time_zero+dhours(72)) |>
+  mutate(temp_end=fifelse(
+    time_72hours<=study_vent_end, time_72hours, study_vent_end)) |>
+  filter(recorded_time>=lpv_time_zero & recorded_time<=temp_end) |>
+  group_by(cohort_id, encounter_block) |>
+  arrange(cohort_id, encounter_block, recorded_time) |>
+  #Fill in Support Type
+  fill(device_category, device_name, .direction = 'down') |>
+  #Fill in Mode Name/Category As Long as Device_category and Device Name is Same
+  mutate(new_device=fcase(
+    row_number()==1, 1,
+    lag(device_name)!=device_name, 1,
+    default = 0
+  )) |>
+  #First Marked New Mode and Now Will Create a Mode Number to Fill In 
+  group_by(cohort_id, encounter_block, new_device) |>
+  mutate(temp_num=row_number()) |>
+  mutate(device_num=fifelse(new_device==1, temp_num, NaN)) |>
+  group_by(cohort_id, encounter_block) |>
+  fill(device_num, .direction = 'down') |>
+  group_by(cohort_id, encounter_block, device_num) |>
+  fill(mode_name, mode_category, .direction = 'down') |>
+  ungroup() |>
+  #Select Needed Variables
+  select(-new_device, -temp_num) 
+  
+rm(temp)
+
+#Mark Eligible Vent Modes for LPV Assessment
+eligible_modes <- c('PC', 'PRVC', 'SIMV Pressure', 'SIMV PRVC', 'SIMV Vol', 'VC', 'VC/AC', 'Volume Guarantee')
+tv_set_mode <- c('PRVC', 'SIMV PRVC', 'SIMV Vol', 'VC', 'VC/AC', 'Volume Guarantee')
+tv_exhaled_mode <- c('PC', 'SIMV Pressure', 'ASV', 'Bi-level/Bi-vent', 'CPAP', 'NAVA', 'PS', 'VS')
+
+vent72 <- vent72 |>
+  mutate(eligible_mode=fifelse(device_name %in% eligible_modes, 1, 0)) |>
+  #Create a Variable that Can be Used to Assess LPV (in other words pick either exhaled or set tidal volume depending on mode)
+  mutate(tv_lpv=fcase(
+    device_name %in% tv_set_mode, tidal_volume_set,
+    device_name %in% tv_exhaled_mode, tidal_volume_obs
+  )) |>
+  #Will Allow for Exhaled TV in PRVC if tv_lpv is missing
+  mutate(tv_lpv=fifelse(
+    mode_name=='PRVC' & is.na(tv_lpv), tidal_volume_obs, tv_lpv
+  )) |>
+  #Some Outlier Filtering - Can use Observed Tidal Volume to Impute Set tidal volume in controlled modes when the set tidal volume is a complete outlier
+  mutate(tv_lpv=fifelse(
+    tv_lpv>2000 & device_name %in% tv_set_mode, tidal_volume_obs, tv_lpv
+  )) |>
+  mutate(tv_lpv=fifelse(
+    tv_lpv<100 & on_ecmo==0 & device_name %in% tv_set_mode, tidal_volume_obs, tv_lpv
+  )) |>
+  mutate(tv_lpv=fifelse(
+    tv_lpv<100 & on_ecmo==0 & device_name %in% tv_set_mode & tidal_volume_obs<100, NaN, tv_lpv
+  )) |>
+  mutate(tv_lpv=fifelse(
+    tv_lpv<100 & on_ecmo==0 & device_name %in% tv_exhaled_mode, NaN, tv_lpv
+  )) |>
+  #Within a Device can Carry Forward Tidal Volume
+  group_by(cohort_id, encounter_block, device_num) |>
+  fill(tv_lpv, .direction = 'downup') |>
+  #PEEP, PPLat and PPeak Outlier Filtering Can Go Here
+  mutate(peep_set=fifelse(peep_set>=35, NaN, peep_set)) |> #NOTE 30 is the max for 35 and below
+  mutate(plateau_pressure_obs=fifelse(plateau_pressure_obs>=60 | plateau_pressure_obs<=5, NaN, plateau_pressure_obs)) |>
+  mutate(peak_inspiratory_pressure_obs=fifelse(
+    peak_inspiratory_pressure_obs>100 | 
+    (!is.na(peep_set) & peak_inspiratory_pressure_obs<=peep_set) |
+    peak_inspiratory_pressure_obs<=5, NaN, peak_inspiratory_pressure_obs)) |>
+  #Now Process Plateau Pressure
+  #For APRV will Use Phigh
+  #For a new Device Can Use Peak Pressure if The FIrst Observation is Missing a Plateau Measurement
+  mutate(pplat_lpv=plateau_pressure_obs) |>
+  mutate(pplat_lpv=fifelse(
+    mode_name=='Bi-level/Bi-vent', phigh, pplat_lpv
+  )) |>
+  #Now Create TV/KGPBW
+  mutate(ibw=fcase(
+      gender=="Male", 50 + 2.3*(height_inches-60),
+      gender=="Female" | gender=='Unknown', 45.5 + 2.3*(height_inches-60) #As of 08/17/2024 there is one gender 'unknown' in this cohort. The patient was born with female sex characteristics and for this analysis will use 'female' IBW calculations
+    )) |>
+  mutate(tv_pbw=round(tv_lpv/ibw, 1)) |>
+  ungroup()
+
+#Evaluate Outliers for tv_pbw
+tv_outlier <- vent72 |> 
+  filter(!is.na(tv_lpv)) |>
+  select(cohort_id:tidal_volume_set, tidal_volume_obs, on_ecmo, tv_lpv, tv_pbw, height_inches, eligible_mode)
+
+print('Distribution of Tidal Volumea NOT on ECMO')
+summary(tv_outlier$tv_pbw[tv_outlier$on_ecmo==0])
+hist(tv_outlier$tv_pbw[tv_outlier$on_ecmo==0])
+summary(tv_outlier$tv_lpv[tv_outlier$on_ecmo==0])
+hist(tv_outlier$tv_lpv[tv_outlier$on_ecmo==0])
+
+print('Distribution of Tidal Volumea NOT on ECMO and On Eligible Mode')
+summary(tv_outlier$tv_pbw[tv_outlier$on_ecmo==0 & tv_outlier$eligible_mode==1])
+hist(tv_outlier$tv_pbw[tv_outlier$on_ecmo==0 & tv_outlier$eligible_mode==1])
+summary(tv_outlier$tv_lpv[tv_outlier$on_ecmo==0 & tv_outlier$eligible_mode==1])
+hist(tv_outlier$tv_lpv[tv_outlier$on_ecmo==0 & tv_outlier$eligible_mode==1])
+
+rm(tv_outlier)
+
+#Delineate Which TV Will be Eligible For Analysis (Not on ECMO, On Eligible Mode, Height Available)
+vent72 <- vent72 |>
+  mutate(eligible_tv=fifelse(
+    on_ecmo==0 & eligible_mode==1 & !is.na(height_inches), 1, 0
+  ))
+
+vent72 <- vent72 |>
+  select(cohort_id, recorded_time:encounter_block, ecmo_start:ecmo_type, device_num:eligible_tv)
+
+#Save a Version of this 72 Hours Long Form Ventilator Dataset
+#Will do Final Outcome Processing in Analytic Stage so We Can Best Describe the N 
+write_parquet(vent72, paste0(project_path, '/data/ventilator_long_72hours.parquet'))
+
+#Merge the ECMO Summary Into the MV Eligible Dataset
+ecmo_summary <- ecmo_summary |> select(-pat_enc_csn_id)
+mv_eligible <- mv_eligible |>
+  left_join(ecmo_summary) |>
+  mutate(received_ecmo=fifelse(is.na(ecmo_start), 0, 1)) 
+
+rm(ecmo_summary, vent_long, weight)
+```
+```{r Airway Variables}
+first_airway <- open_dataset('~/workspace/Storage/chochbe1/JH_CCRD/data/first_airway') |>
+  left_join(in_cohort) |>
+  filter(in_cohort==1) |>
+  select(-in_cohort) |>
+  select(cohort_id, encounter_block, first_ett_time, first_trach_time, tracheostomy) |>
+  collect() |>
+  group_by(cohort_id, encounter_block) |>
+  arrange(cohort_id, first_ett_time, first_trach_time) |>
+  #Fill Upwards for Tracheostomy Status in Encounter Blocks
+  fill(first_trach_time, tracheostomy, .direction = 'up') |>
+  #Fix Tracheostomy Variable to Reflect if Trach was in Second Encounter of Encounter Block
+  mutate(temp=fcase(
+    first_ett_time<first_trach_time, 2
+  )) |>
+  mutate(temp=factor(temp, levels= c(0, 1, 2), labels = c("No Trach", "Trach First Airway", "Trach After ETT"))) |>
+  mutate(tracheostomy=fifelse(
+    temp=='Trach After ETT' & tracheostomy!='Trach After ETT' & 
+      !is.na(tracheostomy) & !is.na(temp), temp, tracheostomy
+  )) |>
+  filter(row_number()==1) |>
+  ungroup() |>
+  select(-temp)
+
+mv_eligible <- mv_eligible |>
+  left_join(first_airway)
+```
+
+
+
+```{r Create Final Dataset}
+lpv_clinical_data <- demos_outcomes |>
+  #Keep Study Start Times from MV Eligible Dataset
+  select(cohort_id, encounter_block, admit_source:ethnicity, nonwhite:weight_kg, max_cns_sofa:code_stat_end)
+
+temp_mv <- mv_eligible |>
+  select(cohort_id:vent_episode_num, link_group, linked_o2_episode, final_admit_date:ecmo_type, received_ecmo:tracheostomy)
+
+lpv_clinical_data <- lpv_clinical_data |>
+  left_join(temp_mv)
+
+rm(temp_mv)
+
+```
+```{r Save Needed Datasets}
+write_parquet(lpv_clinical_data, paste0(project_path, '/data/lpv_clinical_data.parquet'))
+write_parquet(in_cohort, paste0(project_path, '/data/in_cohort.parquet'))
+
+```
+
